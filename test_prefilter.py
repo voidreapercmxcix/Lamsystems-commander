@@ -11,15 +11,8 @@ Each case: (label, command, expected_action) where expected_action is one of:
 import sys
 import pathlib
 
-# Make shell.py importable by adding src/ to sys.path: the repo-relative
-# path first, then the known host path as a fallback.
-for candidate in (
-    str(pathlib.Path(__file__).resolve().parent / "src"),
-    "/home/lam/Documents/Lamsystems-commander/src",
-):
-    if pathlib.Path(candidate).is_dir():
-        sys.path.insert(0, candidate)
-        break
+# Make shell.py importable by adding the repo-relative src/ to sys.path.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "src"))
 
 # Stub out the optional MCP dependency before importing shell — we only need
 # the pure validation functions, not the executor.
@@ -69,7 +62,7 @@ def evaluate(command: str) -> str:
 
 CASES = [
     # ---- Should PASS the filter (whitelist commands, clean args) ----
-    ("ls -la /home/lam",                           "pass"),
+    ("ls -la /home/user",                          "pass"),
     ("ps aux",                                     "pass"),
     ("cat /etc/hostname",                          "pass"),
     ("find /tmp -name '*.log'",                    "pass"),
