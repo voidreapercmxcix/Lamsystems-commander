@@ -6,6 +6,12 @@ versions follow [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- Tool annotations: only `lc_confirm_destructive` and `lc_kill_process` are
+  flagged `destructiveHint: True`, so MCP clients honour "Always allow" on
+  read/write/edit/move/exec/process tools instead of prompting on every call.
+  Server-side gates are unchanged. See "Approval prompts" in the README.
+
 ## [0.1.0] - 2026-09-28
 
 First public release.
