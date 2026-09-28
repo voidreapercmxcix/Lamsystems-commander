@@ -6,6 +6,8 @@ Each case: (label, command, expected_action) where expected_action is one of:
   "fail_prefilter" — pre-filter fails
   "fail_ssh"       — pre-filter passes, SSH gate fires
   "fail_network"   — pre-filter passes, network exfil gate fires
+  "destructive"    — pre-filter passes, destructive hard wall fires
+                     (needs an lc_confirm_destructive token to run)
 """
 
 import sys
@@ -57,10 +59,23 @@ def evaluate(command: str) -> str:
         return "fail_ssh"
     if command_has_network_exfil(command):
         return "fail_network"
+    if command_is_destructive(command):
+        return "destructive"
     return "pass"
 
 
 CASES = [
+    # ---- Destructive hard wall: every rm, recursive or not ----
+    ("rm /tmp/foo.txt",                            "destructive"),
+    ("rm -f /tmp/foo.txt",                         "destructive"),
+    ("rm -rf /tmp/foo",                            "destructive"),
+    ("rm .git/index.lock",                         "destructive"),
+    ("sudo rm /etc/motd",                          "destructive"),
+    ("ls && rm /tmp/foo.txt",                      "destructive"),
+    ("dd if=/dev/zero of=/tmp/x bs=1M count=1",    "destructive"),
+    ("shred /tmp/foo.txt",                         "destructive"),
+    ("fdisk -l",                                   "pass"),
+    ("echo rm",                                    "pass"),
     # ---- Should PASS the filter (whitelist commands, clean args) ----
     ("ls -la /home/user",                          "pass"),
     ("ps aux",                                     "pass"),

@@ -462,7 +462,7 @@ async def request_sudo_approval(ctx, command: str, *, allow_passthrough: bool = 
 # Session sudo-password cache (non-destructive commands only)
 # ---------------------------------------------------------------------------
 # Opt-in via LAMSYSTEMS_COMMANDER_SUDO_CACHE=session (default off). When on, a
-# password entered once through the kdialog/elicit password path is held in
+# password entered once through a password method (elicit/zenity/kdialog) is held in
 # process memory and reused for subsequent NON-destructive sudo commands within
 # an idle TTL, so a read-only scan prompts once instead of on every call.
 #
@@ -470,7 +470,7 @@ async def request_sudo_approval(ctx, command: str, *, allow_passthrough: bool = 
 # (shell._execute_atomic_block) only consults it when is_destructive is False.
 # The cache lives only in RAM, is wiped when the process exits, and slides its
 # expiry on each use. It does nothing under pkexec mode (polkit keeps the
-# password itself, so the server never sees one to cache) - kdialog/elicit only.
+# password itself, so the server never sees one to cache) - password methods only.
 _SUDO_CACHE: dict = {"password": None, "expires": 0.0}
 
 

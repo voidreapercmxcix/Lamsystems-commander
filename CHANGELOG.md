@@ -7,11 +7,17 @@ versions follow [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- README documented the sudo gate as "no caching"; the opt-in
+  `LAMSYSTEMS_COMMANDER_SUDO_CACHE` session cache and its TTL are now described.
 - Session sudo cache path now runs `sudo -k` after each command, matching the
   password path. Previously a cached-password command left sudo's own
   timestamp primed for its default lifetime.
 
 ### Changed
+- Every `rm` invocation is now destructive, not only recursive ones. A
+  single-file delete needs its own `lc_confirm_destructive` token, so a
+  session-allowed `lc_exec_command` can never delete a file without a
+  per-command human approval.
 - Tool annotations: only `lc_confirm_destructive` and `lc_kill_process` are
   flagged `destructiveHint: True`, so MCP clients honour "Always allow" on
   read/write/edit/move/exec/process tools instead of prompting on every call.
