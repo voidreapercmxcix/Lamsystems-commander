@@ -181,6 +181,54 @@ class _Password(BaseModel):
 # through to kdialog/pkexec.
 _ELICIT_TIMEOUT_S: float = 8.0
 
+# ---------------------------------------------------------------------------
+# GUI environment discovery
+# ---------------------------------------------------------------------------
+# MCP clients (Claude Desktop / Cowork, LM Studio) launch servers with a clean
+# environment: no DISPLAY, no WAYLAND_DISPLAY, no XDG_RUNTIME_DIR. Without
+# these, zenity/kdialog exit non-zero in 0 seconds with "cannot open display",
+# which used to be recorded as a *user decline*. Probe the usual sockets and
+# hand every dialog an env that can actually reach the session.
+def gui_env() -> Optional[dict]:
+    """Environment for launching a GUI dialog, or None if no display is
+    reachable. Starts from os.environ and fills in DISPLAY / WAYLAND_DISPLAY /
+    XDG_RUNTIME_DIR from the standard socket locations when missing."""
+    env = dict(os.environ)
+    uid = os.getuid()
+    runtime = env.get("XDG_RUNTIME_DIR") or f"/run/user/{uid}"
+    if os.path.isdir(runtime):
+        env.setdefault("XDG_RUNTIME_DIR", runtime)
+
+    if not env.get("WAYLAND_DISPLAY"):
+        try:
+            socks = sorted(
+                n for n in os.listdir(runtime)
+                if n.startswith("wayland-") and not n.endswith(".lock")
+            )
+        except OSError:
+            socks = []
+        if socks:
+            env["WAYLAND_DISPLAY"] = socks[0]
+
+    if not env.get("DISPLAY"):
+        try:
+            xs = sorted(
+                n for n in os.listdir("/tmp/.X11-unix") if n.startswith("X")
+            )
+        except OSError:
+            xs = []
+        if xs:
+            env["DISPLAY"] = ":" + xs[0][1:]
+
+    if env.get("DISPLAY") or env.get("WAYLAND_DISPLAY"):
+        return env
+    return None
+
+
+def gui_available(binary_name: str) -> bool:
+    return shutil.which(binary_name) is not None and gui_env() is not None
+
+
 # How long a native GUI password / confirm dialog may stay open before we give
 # up, CLOSE it, and report "no password entered". Must stay comfortably under
 # the MCP client's tools/call ceiling (LamSystems kills the call at 120s) so the
@@ -283,7 +331,8 @@ async def _try_gui_dialog(
     or no DISPLAY/WAYLAND_DISPLAY is available."""
     if shutil.which(binary_name) is None:
         return None
-    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+    env = gui_env()
+    if env is None:
         # No graphical session reachable from this process — dialog would just hang.
         return None
 
@@ -292,6 +341,7 @@ async def _try_gui_dialog(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         start_new_session=True,
+        env=env,
     )
     stdout, _ = await _dialog_communicate(proc, timeout=_SUDO_DIALOG_TIMEOUT_S)
     if stdout is None:
@@ -341,7 +391,8 @@ async def _try_zenity(command: str) -> Optional[SudoApprovalResult]:
 async def _try_zenity_confirm(command: str, title: str) -> Optional[bool]:
     if shutil.which("zenity") is None:
         return None
-    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+    env = gui_env()
+    if env is None:
         return None
     proc = await asyncio.create_subprocess_exec(
         "zenity", "--question",
@@ -351,6 +402,7 @@ async def _try_zenity_confirm(command: str, title: str) -> Optional[bool]:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         start_new_session=True,
+        env=env,
     )
     out, _ = await _dialog_communicate(proc, timeout=_SUDO_DIALOG_TIMEOUT_S)
     if out is None:
@@ -511,3 +563,97 @@ def sudo_cache_put(password: str) -> None:
 def sudo_cache_clear() -> None:
     _SUDO_CACHE["password"] = None
     _SUDO_CACHE["expires"] = 0.0
+
+
+# ---------------------------------------------------------------------------
+# Destructive-confirmation dialog (used by server.lc_confirm_destructive)
+# ---------------------------------------------------------------------------
+@dataclass
+class ConfirmDialogResult:
+    """Outcome of a yes/no GUI confirmation.
+
+    outcome is one of:
+      "granted"     — user clicked the confirm button
+      "declined"    — user clicked cancel / closed the dialog (a real human "no")
+      "timeout"     — dialog stayed open past the limit with no answer
+      "unavailable" — dialog could not be shown (no binary, no display, crash)
+    Only "declined" may be written to the session decline cache."""
+    outcome: str
+    method: str
+    detail: str = ""
+
+
+_DISPLAY_ERROR_MARKERS = (
+    "cannot open display", "could not connect", "unable to init",
+    "no protocol specified", "failed to connect", "could not open display",
+    "display not found", "qxcbconnection", "could not initialize",
+)
+
+
+async def _run_confirm_dialog(binary: str, argv: list[str], *, method: str) -> ConfirmDialogResult:
+    if shutil.which(binary) is None:
+        return ConfirmDialogResult("unavailable", method, f"{binary} not installed")
+    env = gui_env()
+    if env is None:
+        return ConfirmDialogResult("unavailable", method, "no DISPLAY / WAYLAND_DISPLAY reachable")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            binary, *argv,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+            env=env,
+        )
+    except Exception as e:  # pragma: no cover - exec failure
+        return ConfirmDialogResult("unavailable", method, f"launch failed: {type(e).__name__}: {e}")
+    out, err = await _dialog_communicate(proc, timeout=_SUDO_DIALOG_TIMEOUT_S)
+    if out is None:
+        return ConfirmDialogResult("timeout", method, f"no answer after {_SUDO_DIALOG_TIMEOUT_S:.0f}s")
+    stderr = (err or b"").decode(errors="replace").strip()
+    low = stderr.lower()
+    if proc.returncode == 0:
+        return ConfirmDialogResult("granted", method, "")
+    if any(m in low for m in _DISPLAY_ERROR_MARKERS):
+        return ConfirmDialogResult("unavailable", method, f"exit {proc.returncode}: {stderr[:200]}")
+    # zenity: 1 = cancel/close, 5 = --timeout expired. kdialog: 1 = no/cancel.
+    if proc.returncode == 1:
+        return ConfirmDialogResult("declined", method, stderr[:200])
+    if proc.returncode == 5:
+        return ConfirmDialogResult("timeout", method, "dialog --timeout expired")
+    return ConfirmDialogResult("unavailable", method, f"exit {proc.returncode}: {stderr[:200]}")
+
+
+async def confirm_destructive_gui(message: str) -> ConfirmDialogResult:
+    """Try zenity, then kdialog. Returns the first result that is not
+    "unavailable"; if both are unavailable, returns the last one so the caller
+    can log why."""
+    last = ConfirmDialogResult("unavailable", "none", "no GUI dialog tool found")
+    r = await _run_confirm_dialog(
+        "zenity",
+        [
+            "--question",
+            "--title=⚠️ DESTRUCTIVE OPERATION",
+            f"--text={message}\n\nProceed?",
+            "--ok-label=CONFIRM — DESTROY",
+            "--cancel-label=Cancel",
+            "--width=500",
+        ],
+        method="zenity",
+    )
+    if r.outcome != "unavailable":
+        return r
+    last = r
+    r = await _run_confirm_dialog(
+        "kdialog",
+        [
+            "--warningyesno", f"{message}\n\nProceed?",
+            "--yes-label", "CONFIRM — DESTROY",
+            "--no-label", "Cancel",
+            "--title", "⚠️ DESTRUCTIVE OPERATION",
+        ],
+        method="kdialog",
+    )
+    if r.outcome != "unavailable":
+        return r
+    r.detail = f"zenity: {last.detail} | kdialog: {r.detail}"
+    return r

@@ -495,7 +495,6 @@ async def lc_confirm_destructive(params: ConfirmDestructiveInput, ctx: Context) 
     command = os.path.expanduser(params.command)
 
     from lamsystems_commander.shell import register_confirmed_command, register_declined_command
-    import subprocess
 
     _tool_log.info(f"CALL lc_confirm_destructive | command={command!r}")
 
@@ -543,28 +542,27 @@ async def lc_confirm_destructive(params: ConfirmDestructiveInput, ctx: Context) 
             return _granted("in-app dialog")
         return _refused(f"in-app dialog (action={result.action})")
 
-    # -- Strategy 2: zenity dialog fallback --------------------------------
-    # run() is blocking and this is an async server, so hand it to a thread;
-    # otherwise a 120s dialog stalls the whole event loop.
-    try:
-        r = await asyncio.to_thread(
-            subprocess.run,
-            [
-                "zenity", "--question",
-                "--title=⚠️ DESTRUCTIVE OPERATION",
-                f"--text={msg}\n\nProceed?",
-                "--ok-label=CONFIRM — DESTROY",
-                "--cancel-label=Cancel",
-                "--width=500",
-            ],
-            timeout=120,
+    # -- Strategy 2: native GUI dialog (zenity, then kdialog) --------------
+    # Runs in prompt.confirm_destructive_gui with a discovered DISPLAY /
+    # WAYLAND_DISPLAY (MCP clients launch us with a clean env), stderr
+    # captured, and a bounded timeout. A dialog that could not be shown is
+    # NOT a decline: only a real human "Cancel" reaches the decline cache.
+    from lamsystems_commander.prompt import confirm_destructive_gui
+    gui = await confirm_destructive_gui(msg)
+    if gui.outcome == "granted":
+        return _granted(gui.method)
+    if gui.outcome == "declined":
+        return _refused(gui.method)
+    if gui.outcome == "timeout":
+        _tool_log.warning(
+            f"lc_confirm_destructive | {gui.method} dialog timed out | {gui.detail} | command={command!r}"
         )
-    except Exception as e:
-        _tool_log.warning(f"lc_confirm_destructive | zenity unavailable ({type(e).__name__}: {e})")
-    else:
-        if r.returncode == 0:
-            return _granted("zenity")
-        return _refused("zenity")
+        return (
+            "✗ NO TOKEN ISSUED. The confirmation dialog timed out with no answer. "
+            "The command has NOT been approved. Ask the user whether they want to "
+            "try again; do NOT retry on your own."
+        )
+    _tool_log.warning(f"lc_confirm_destructive | GUI dialog unavailable | {gui.detail}")
 
     # -- No mechanism available: refuse, loudly ----------------------------
     # This path must never read as approval. The previous wording was advisory
@@ -576,7 +574,8 @@ async def lc_confirm_destructive(params: ConfirmDestructiveInput, ctx: Context) 
     )
     return (
         "ERROR: NO TOKEN ISSUED. No confirmation mechanism is available — this "
-        "client does not support elicitation and zenity could not be launched.\n"
+        "client does not support elicitation and no GUI dialog (zenity/kdialog) "
+        "could be shown — usually no display is reachable from the server process.\n"
         "The command has NOT been approved and lc_exec_command will refuse it.\n"
         "Do NOT retry this tool and do NOT look for an alternative command. "
         "Tell the user they must run the command themselves in a terminal."

@@ -341,8 +341,18 @@ destructive operations in later segments. The model must call
 
 Before any destructive command can run, the model must call `lc_confirm_destructive`
 with the exact command and a plain-English description of what will be destroyed.
-This fires an in-app elicitation dialog (or zenity fallback) showing exactly what
-will be permanently lost. A one-time token is issued only on explicit approval.
+This fires an in-app elicitation dialog (or a zenity / kdialog fallback) showing
+exactly what will be permanently lost. A one-time token is issued only on
+explicit approval.
+
+**A dialog that cannot be shown is not a decline.** MCP clients launch the
+server with a clean environment (no `DISPLAY`, `WAYLAND_DISPLAY` or
+`XDG_RUNTIME_DIR`), so the server discovers the session's display from
+`/run/user/<uid>/wayland-*` and `/tmp/.X11-unix` itself. If no dialog can be
+shown at all, or it times out, the tool reports that loudly, issues no token,
+and records nothing — only a real click on Cancel goes into the session decline
+cache. Claude Desktop / Cowork do not currently support elicitation, so on
+those clients the GUI fallback is the path that runs.
 
 **Token normalisation:** Both `lc_confirm_destructive` and the exec path expand
 `~` to the real home directory before registering or checking tokens. A model
