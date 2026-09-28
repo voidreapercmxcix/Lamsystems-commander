@@ -6,6 +6,11 @@ versions follow [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- Session sudo cache path now runs `sudo -k` after each command, matching the
+  password path. Previously a cached-password command left sudo's own
+  timestamp primed for its default lifetime.
+
 ### Changed
 - Tool annotations: only `lc_confirm_destructive` and `lc_kill_process` are
   flagged `destructiveHint: True`, so MCP clients honour "Always allow" on
