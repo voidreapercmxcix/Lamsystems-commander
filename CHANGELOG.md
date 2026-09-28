@@ -7,6 +7,10 @@ versions follow [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- `lc_confirm_destructive` treated a zenity launch failure (no display, crash)
+  as a user decline and locked the command out for the session. Dialogs now
+  discover `DISPLAY`/`WAYLAND_DISPLAY` from the session sockets, capture
+  stderr, fall back zenity → kdialog, and only a real Cancel is cached.
 - README documented the sudo gate as "no caching"; the opt-in
   `LAMSYSTEMS_COMMANDER_SUDO_CACHE` session cache and its TTL are now described.
 - Session sudo cache path now runs `sudo -k` after each command, matching the
