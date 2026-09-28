@@ -139,6 +139,30 @@ the venv (see `examples/mcp_config.json`):
 The `lc_*` tools should appear in the tool list. `lc_exec_command`'s
 description lists the current allowlist so the model doesn't have to guess.
 
+### Approval prompts (client side)
+
+MCP clients decide when to show their own "allow this tool call?" dialog based
+on the `destructiveHint` annotation each tool declares. This server is tuned
+for use with Claude and similar clients, so only two tools are flagged
+destructive and will keep prompting even after you pick "Always allow":
+
+| Tool | Why it always prompts |
+|---|---|
+| `lc_confirm_destructive` | it *is* the human-in-the-loop step for `rm -rf`, `dd`, `mkfs` … |
+| `lc_kill_process` | signals cannot be taken back |
+
+Everything else — read, write, edit, move, mkdir, shell commands, process
+sessions, search, git — is declared non-destructive so "Always allow" sticks.
+That is safe because the protection lives in the server, not the dialog:
+`lc_exec_command` still runs every command through the pre-filter, the
+allowlist, the network/SSH gate and the destructive hard wall, and
+`lc_write_file`/`lc_edit_block` still go through `_file_guard()`. Turning the
+client prompt off changes nothing about what the server will refuse.
+
+If you are driving this with an abliterated or uncensored local model, you
+want more prompting, not less — flip those hints back to `True` in
+`server.py` (or use a stricter build) before you hand it a shell.
+
 ### Recommended system prompt
 
 Add this to your model's system prompt (Claude's project instructions, or

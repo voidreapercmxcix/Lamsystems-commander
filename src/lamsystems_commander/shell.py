@@ -1264,6 +1264,13 @@ async def _execute_atomic_block(
                 rewritten, stdin_data=(cached + "\n").encode(),
                 cwd=cwd, timeout=timeout, shell=True,
             )
+            # Same per-command policy as the password path: never leave
+            # sudo's own timestamp primed. Our cache re-feeds the password
+            # via -S on every call, so sudo's timestamp is never needed.
+            try:
+                await _run_subprocess(["sudo", "-k"], timeout=5.0)
+            except Exception:
+                pass
             if not _sudo_auth_failed(result):
                 result["sudo_used"] = True
                 result["sudo_method"] = "cache"

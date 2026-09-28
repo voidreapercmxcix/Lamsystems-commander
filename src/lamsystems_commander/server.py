@@ -129,7 +129,7 @@ def _exec_command_description() -> str:
     annotations={
         "title": "Execute shell command (sudo-gated)",
         "readOnlyHint": False,
-        "destructiveHint": True,
+        "destructiveHint": False,
         "idempotentHint": False,
         "openWorldHint": True,
     },
@@ -201,7 +201,7 @@ class WriteFileInput(BaseModel):
 
 @mcp.tool(
     name="lc_write_file",
-    annotations={"title": "Write file", "readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
+    annotations={"title": "Write file", "readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
 )
 async def lc_write_file(params: WriteFileInput) -> str:
     """Write content to a file. Use mode='append' to append rather than overwrite."""
@@ -218,7 +218,7 @@ class EditBlockInput(BaseModel):
 
 @mcp.tool(
     name="lc_edit_block",
-    annotations={"title": "Edit block (find/replace)", "readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
+    annotations={"title": "Edit block (find/replace)", "readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
 )
 async def lc_edit_block(params: EditBlockInput) -> str:
     """Surgically replace an exact substring in a file.
@@ -255,7 +255,7 @@ class MoveFileInput(BaseModel):
 
 @mcp.tool(
     name="lc_move_file",
-    annotations={"title": "Move/rename file", "readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
+    annotations={"title": "Move/rename file", "readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
 )
 async def lc_move_file(params: MoveFileInput) -> str:
     """Move or rename a file or directory."""
@@ -334,7 +334,7 @@ class StartProcessInput(BaseModel):
 
 @mcp.tool(
     name="lc_start_process",
-    annotations={"title": "Start long-running process", "readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": True},
+    annotations={"title": "Start long-running process", "readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True},
 )
 async def lc_start_process(params: StartProcessInput) -> str:
     """Start a long-running process. Returns a session_id for further interaction.
@@ -378,7 +378,7 @@ class InteractInput(BaseModel):
 
 @mcp.tool(
     name="lc_interact_with_process",
-    annotations={"title": "Send stdin to process", "readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
+    annotations={"title": "Send stdin to process", "readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
 )
 async def lc_interact_with_process(params: InteractInput) -> str:
     """Write to a managed session's stdin (e.g., for REPLs, prompts)."""
@@ -393,7 +393,7 @@ class StopSessionInput(BaseModel):
 
 @mcp.tool(
     name="lc_stop_process_session",
-    annotations={"title": "Stop managed session", "readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": False},
+    annotations={"title": "Stop managed session", "readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
 )
 async def lc_stop_process_session(params: StopSessionInput) -> str:
     """Terminate a managed session."""

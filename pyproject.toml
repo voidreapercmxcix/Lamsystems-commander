@@ -13,7 +13,7 @@ authors = [{ name = "James (LamSystems)" }]
 keywords = ["mcp", "claude", "terminal", "shell", "sudo", "allowlist", "desktop-commander"]
 
 dependencies = [
-    "mcp>=1.2.0",
+    "mcp<2",
     "pydantic>=2.5",
     "rank-bm25>=0.2.2",
 ]
