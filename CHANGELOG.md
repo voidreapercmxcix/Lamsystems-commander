@@ -44,5 +44,5 @@ First public release.
 - `test_prefilter.py` harness (64 cases) and `check_import.py` smoke check
 - Red-team findings and known limitations documented in the README
 
-[Unreleased]: https://github.com/Voidreaper2026/Lamsystems-commander/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/Voidreaper2026/Lamsystems-commander/releases/tag/v0.1.0
+[Unreleased]: https://github.com/voidreapercmxcix/Lamsystems-commander/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/voidreapercmxcix/Lamsystems-commander/releases/tag/v0.1.0

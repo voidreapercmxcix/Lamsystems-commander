@@ -33,10 +33,10 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/Voidreaper2026/Lamsystems-commander"
-Repository = "https://github.com/Voidreaper2026/Lamsystems-commander"
-Issues = "https://github.com/Voidreaper2026/Lamsystems-commander/issues"
-Changelog = "https://github.com/Voidreaper2026/Lamsystems-commander/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/voidreapercmxcix/Lamsystems-commander"
+Repository = "https://github.com/voidreapercmxcix/Lamsystems-commander"
+Issues = "https://github.com/voidreapercmxcix/Lamsystems-commander/issues"
+Changelog = "https://github.com/voidreapercmxcix/Lamsystems-commander/blob/main/CHANGELOG.md"
 
 [project.scripts]
 lamsystems-commander = "lamsystems_commander.__main__:main"
