@@ -68,7 +68,7 @@ licensed too. The difference is posture, not price:
 | Wrapper handling | not documented | `sudo`, `env`, `nice`, `timeout`, `uv run` etc. are unwrapped and the real binary is vetted |
 | Interpreter escape hatches | not documented | `python -c`, `node -e`, `find -exec`, package-manager installs blocked per binary |
 | Destructive commands | no approval step documented; README says "not a sandbox" | hard wall + one-time confirmation token via a dialog you click |
-| Sudo | not documented | fresh approval per call through MCP elicitation / zenity / kdialog / pkexec |
+| Sudo | not documented | fresh approval per call through MCP elicitation / zenity / kdialog / pkexec; opt-in session cache for non-destructive commands only |
 | Pipes / redirects / subshells | standard shell | blocked; scratchpad pattern instead |
 | Adversarial testing | not documented | red-teamed with an abliterated model, findings below |
 
@@ -159,6 +159,13 @@ allowlist, the network/SSH gate and the destructive hard wall, and
 `lc_write_file`/`lc_edit_block` still go through `_file_guard()`. Turning the
 client prompt off changes nothing about what the server will refuse.
 
+Deletion is never session-allowed. **Every** `rm` — `rm FILE`, `rm -f FILE`,
+`rm -rf DIR` — is on the destructive list, alongside `dd`, `mkfs`, `shred`,
+`wipefs`, `blkdiscard` and the partition editors, so each one needs its own
+`lc_confirm_destructive` token. The token is keyed on the exact command
+string and consumed on use: approving `rm .git/index.lock` approves that one
+file, once. It never widens to the folder or the session.
+
 If you are driving this with an abliterated or uncensored local model, you
 want more prompting, not less — flip those hints back to `True` in
 `server.py` (or use a stricter build) before you hand it a shell.
@@ -181,7 +188,7 @@ You must NEVER attempt to bypass, circumvent, or find alternatives to the sudo
 approval gate. If the user declines, the command is cancelled permanently.
 For long-running commands (rsync, large find, package installs, builds) always use
 lc_start_process and poll with lc_read_process_output rather than lc_exec_command.
-lc_confirm_destructive is ONLY for commands that destroy or modify data (rm -r, dd,
+lc_confirm_destructive is ONLY for commands that destroy or modify data (any rm, dd,
 mkfs, shred, wipefs). Read-only sudo commands like smartctl, lsblk, journalctl do
 NOT need lc_confirm_destructive.
 
@@ -324,7 +331,7 @@ Both gates also apply to `lc_start_process` via `command_gate`.
 before execution — not just the first binary. All segments of a chained
 command are checked.
 
-Commands matching destructive patterns (`rm -r`, `dd`, `mkfs`, `shred`,
+Commands matching destructive patterns (any `rm`, `dd`, `mkfs`, `shred`,
 `wipefs`, writes to block devices) are blocked regardless of sudo. A safe
 binary earlier in the pipeline (e.g. `cat`, `ls`, `echo`) does not protect
 destructive operations in later segments. The model must call
@@ -355,8 +362,28 @@ not to retry or find alternatives.
 ### Layer 6 — Sudo gate
 
 All `sudo` commands (including confirmed destructive ones) require a fresh
-password approval via MCP elicitation, zenity, kdialog, or pkexec. No caching.
-Every sudo call requires a fresh prompt.
+password approval via MCP elicitation, zenity, kdialog, or pkexec. By default
+nothing is cached: every sudo call prompts, and `sudo -k` wipes sudo's own
+timestamp after each one.
+
+**Optional session cache (off by default).** Set
+`LAMSYSTEMS_COMMANDER_SUDO_CACHE=session` in the server's `env` block and a
+password entered once is held in server memory and reused for later
+**non-destructive** sudo commands, so a read-only scan (`smartctl`, `dmesg`,
+`journalctl` …) prompts once instead of every call. Rules:
+
+- Destructive commands never read or fill the cache — they always prompt fresh,
+  after the `lc_confirm_destructive` token.
+- The cache idles out after `LAMSYSTEMS_COMMANDER_SUDO_CACHE_TTL` seconds
+  (default 900), sliding on each use, and is wiped when the server exits.
+- It only applies to the password methods (elicit, zenity, kdialog). Under
+  pkexec polkit holds the credential and the server never sees a password.
+- A cached password sudo rejects is dropped immediately and you are prompted.
+- `sudo -k` still runs after every cached command, so sudo's own timestamp is
+  never left primed by this server.
+
+The env var must be in the MCP client's config — MCP servers are launched
+with a clean environment, so exporting it in your shell does nothing.
 
 Safe sudo commands (`smartctl`, `fdisk`, `dnf`, etc.) bypass the dialog and run
 via `sudo -n` using cached credentials — no repeated password prompts for routine
@@ -379,7 +406,7 @@ list is curated for an AI-orchestration and model-tuning workflow.
 - **Filesystem read:** `ls`, `cat`, `head`, `tail`, `find`, `stat`, `file`,
   `wc`, `grep`, `tree`, `realpath`, `readlink`, `basename`, `dirname`, `pwd`
 - **File create / move / link / delete:** `cp`, `mv`, `mkdir`, `touch`, `ln`, `rm`
-  — plain `rm file.txt` passes; `rm -r` / `rm -rf` hits the destructive wall
+  — every `rm`, including plain `rm file.txt`, hits the destructive wall
 - **Permissions:** `chmod`, `chown`, `chgrp`
 - **Text processing:** `sed`, `awk`, `cut`, `sort`, `uniq`, `tr`, `diff`,
   `patch`, `tee`, `cmp`, `comm`, `rev`, `tac`, `paste`, `column`, `nl`
@@ -592,7 +619,7 @@ hits a hard OS-level `Permission Denied`.
 lamsystems-commander/
 ├── pyproject.toml
 ├── README.md
-├── test_prefilter.py              # pre-filter test harness (64 cases)
+├── test_prefilter.py              # pre-filter test harness (74 cases)
 ├── check_import.py                # server import + tool registration smoke check
 ├── examples/
 │   └── mcp_config.json
@@ -631,7 +658,7 @@ or the pre-filter pipeline itself:
 python3 test_prefilter.py
 ```
 
-Expected output: `64/64 tests pass`. If a test fails, do not deploy — fix the
+Expected output: `74/74 tests pass`. If a test fails, do not deploy — fix the
 regression first.
 
 For an interactive smoke test (requires `mcp[cli]`):

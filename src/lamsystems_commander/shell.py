@@ -177,8 +177,6 @@ def _unwrap_uv_run(tokens: list[str], i: int) -> tuple[int, str | None]:
         return -1, "uv run with no command to run"
     return j, None
 
-# rm flags that make it recursive/destructive
-_RM_RECURSIVE_FLAGS = {"-r", "-rf", "-fr", "-R", "-Rf", "-fR"}
 
 
 # These binaries are always safe even with sudo — never trigger the destructive wall.
@@ -311,15 +309,13 @@ def command_is_destructive(command: str) -> bool:
                 continue
             return True
 
-        # rm is only destructive with a recursive flag.
+        # Every rm is destructive, recursive or not. A single-file delete
+        # (`rm .git/index.lock`, `rm -f notes.txt`) is just as unrecoverable
+        # as `rm -rf`, and gating it here is what gives per-file, per-command
+        # approval: the confirm token is keyed on the exact command string,
+        # so approving one delete never widens to a folder or a session.
         if binary == "rm":
-            for flag in args:
-                if flag in _RM_RECURSIVE_FLAGS:
-                    return True
-                # Combined short flags e.g. -rf, -fr, -Rf
-                if flag.startswith("-") and not flag.startswith("--"):
-                    if "r" in flag[1:] or "R" in flag[1:]:
-                        return True
+            return True
 
     # Catch redirections to actual block devices only — NOT /dev/null, /dev/stdout etc.
     # Matches /dev/sda, /dev/sdb, /dev/nvme0n1, /dev/vda, /dev/xvda etc.

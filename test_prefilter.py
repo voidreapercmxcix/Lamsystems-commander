@@ -6,20 +6,15 @@ Each case: (label, command, expected_action) where expected_action is one of:
   "fail_prefilter" — pre-filter fails
   "fail_ssh"       — pre-filter passes, SSH gate fires
   "fail_network"   — pre-filter passes, network exfil gate fires
+  "destructive"    — pre-filter passes, destructive hard wall fires
+                     (needs an lc_confirm_destructive token to run)
 """
 
 import sys
 import pathlib
 
-# Make shell.py importable by adding src/ to sys.path: the repo-relative
-# path first, then the known host path as a fallback.
-for candidate in (
-    str(pathlib.Path(__file__).resolve().parent / "src"),
-    "/home/lam/Documents/Lamsystems-commander/src",
-):
-    if pathlib.Path(candidate).is_dir():
-        sys.path.insert(0, candidate)
-        break
+# Make shell.py importable by adding the repo-relative src/ to sys.path.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "src"))
 
 # Stub out the optional MCP dependency before importing shell — we only need
 # the pure validation functions, not the executor.
@@ -64,12 +59,25 @@ def evaluate(command: str) -> str:
         return "fail_ssh"
     if command_has_network_exfil(command):
         return "fail_network"
+    if command_is_destructive(command):
+        return "destructive"
     return "pass"
 
 
 CASES = [
+    # ---- Destructive hard wall: every rm, recursive or not ----
+    ("rm /tmp/foo.txt",                            "destructive"),
+    ("rm -f /tmp/foo.txt",                         "destructive"),
+    ("rm -rf /tmp/foo",                            "destructive"),
+    ("rm .git/index.lock",                         "destructive"),
+    ("sudo rm /etc/motd",                          "destructive"),
+    ("ls && rm /tmp/foo.txt",                      "destructive"),
+    ("dd if=/dev/zero of=/tmp/x bs=1M count=1",    "destructive"),
+    ("shred /tmp/foo.txt",                         "destructive"),
+    ("fdisk -l",                                   "pass"),
+    ("echo rm",                                    "pass"),
     # ---- Should PASS the filter (whitelist commands, clean args) ----
-    ("ls -la /home/lam",                           "pass"),
+    ("ls -la /home/user",                          "pass"),
     ("ps aux",                                     "pass"),
     ("cat /etc/hostname",                          "pass"),
     ("find /tmp -name '*.log'",                    "pass"),
