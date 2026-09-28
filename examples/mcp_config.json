@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "lamsystems-commander": {
+      "command": "/home/lam/Documents/Lamsystems-commander/.venv/bin/lamsystems-commander",
+      "args": [],
+      "env": {}
+    }
+  }
+}

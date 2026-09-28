@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lamsystems-commander"
+version = "0.1.0"
+description = "Safety-first local MCP server: strict-allowlist shell, files, search, processes and git with human-in-the-loop gating. A self-hosted Desktop Commander alternative."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "James (LamSystems)" }]
+keywords = ["mcp", "claude", "terminal", "shell", "sudo", "allowlist", "desktop-commander"]
+
+dependencies = [
+    "mcp>=1.2.0",
+    "pydantic>=2.5",
+    "rank-bm25>=0.2.2",
+]
+
+[project.scripts]
+lamsystems-commander = "lamsystems_commander.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+lamsystems_commander = ["py.typed"]
