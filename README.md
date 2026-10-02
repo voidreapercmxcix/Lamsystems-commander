@@ -47,7 +47,7 @@ rest. **Your finger on Cancel is the last line of defence.**
 - Use an abliterated/uncensored model without understanding what that means
 - Approve a sudo gate or confirmation dialog you were not expecting
 - Leave an agentic session running unattended with approval dialogs enabled
-- Test "will it delete my drive" unless you are prepared for the answer 💩
+- Don't test "will it delete my drive" unless you are prepared for the answer 💩
 
 **Model recommendation:** Use a non-abliterated instruct model for daily use.
 The safety layers handle legitimate admin tasks. You do not need an uncensored
