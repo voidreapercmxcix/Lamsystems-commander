@@ -102,9 +102,13 @@ def _exec_command_description() -> str:
         "ALLOWED BINARIES - only these run; anything else is rejected, even under "
         f"sudo:\n{allowed}\n\n"
         "RULES:\n"
-        "- No shell interpreters (bash, sh, perl, ruby). To run a script use "
+        "- No inline code and no sh/perl/ruby. To run a script use "
         "`python3 FILE.py` or `node FILE.js` - a script FILE, never inline code "
         "(`python3 -c ...` / `node -e ...` are blocked).\n"
+        "- Shell scripts: ONLY `bash /absolute/path/script.sh [args]` (full path, "
+        "no `~`, no bash flags, never `bash -c`, not from /tmp). EVERY run needs "
+        "user approval: call lc_confirm_destructive with the exact command first. "
+        "If the script file changes after approval, the approval is void.\n"
         "- Pipes work: `a | b | c` (every stage must be an allowed binary). "
         "Sequencing works: `a && b`, `a || b`, `a ; b`.\n"
         "- Redirects `>`, `>>`, `<` are BANNED. To write a file, use `tee` or a "
@@ -480,7 +484,8 @@ class _DestructiveConfirm(BaseModel):
     annotations={"title": "Confirm destructive operation (REQUIRED before destructive commands)", "readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
 )
 async def lc_confirm_destructive(params: ConfirmDestructiveInput, ctx: Context) -> str:
-    """MANDATORY gate before any destructive command (rm -r, dd, mkfs, shred, wipefs, /dev/ writes).
+    """MANDATORY gate before any destructive command (rm, dd, mkfs, shred, wipefs, /dev/ writes)
+    and before every shell script run (`bash /absolute/path/script.sh`).
 
     Shows the user an explicit confirmation dialog describing exactly what will be destroyed.
     If the user approves, issues a one-time token allowing lc_exec_command to proceed once.
@@ -494,18 +499,43 @@ async def lc_confirm_destructive(params: ConfirmDestructiveInput, ctx: Context) 
     # matches the expanded form that pre_filter produces in lc_exec_command.
     command = os.path.expanduser(params.command)
 
-    from lamsystems_commander.shell import register_confirmed_command, register_declined_command
+    from lamsystems_commander.shell import (
+        register_confirmed_command, register_declined_command,
+        command_is_destructive, script_run_targets, script_fingerprint,
+    )
 
     _tool_log.info(f"CALL lc_confirm_destructive | command={command!r}")
 
-    msg = (
-        f"⚠️  DESTRUCTIVE OPERATION — CANNOT BE UNDONE\n\n"
-        f"{params.description}\n\n"
-        f"Command: {command}"
-    )
+    # Script runs (`bash /path/script.sh`): fingerprint the file NOW, before
+    # the dialog, so the approval is bound to the content that exists while
+    # the user is deciding. An unreadable script never reaches the dialog.
+    try:
+        script_fp = script_fingerprint(command)
+    except OSError as e:
+        _tool_log.error(f"FAIL lc_confirm_destructive | script unreadable | {e} | command={command!r}")
+        return (
+            f"ERROR: NO TOKEN ISSUED. The script could not be read ({e}). "
+            "Nothing was shown to the user. Check the path and try again."
+        )
+
+    if script_fp is not None and not command_is_destructive(command, include_script_runs=False):
+        scripts = "\n".join(f"Script: {t}" for t in script_run_targets(command))
+        msg = (
+            f"▶  RUN SHELL SCRIPT — it can do anything your user account can\n\n"
+            f"{params.description}\n\n"
+            f"{scripts}\n"
+            f"Content SHA-256: {script_fp[:16]}…\n"
+            f"Command: {command}"
+        )
+    else:
+        msg = (
+            f"⚠️  DESTRUCTIVE OPERATION — CANNOT BE UNDONE\n\n"
+            f"{params.description}\n\n"
+            f"Command: {command}"
+        )
 
     def _granted(method: str) -> str:
-        register_confirmed_command(command)
+        register_confirmed_command(command, script_fp)
         _tool_log.info(f"OK   lc_confirm_destructive | GRANTED via {method} | command={command!r}")
         return (
             f"✓ User confirmed via {method}. One-time token issued.\n"

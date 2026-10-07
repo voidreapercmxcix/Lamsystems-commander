@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import hashlib
 import os
 import pathlib
 import re
@@ -65,14 +66,42 @@ from lamsystems_commander.prompt import (
 _confirmed_destructive: dict[str, bool] = {}
 
 
-def register_confirmed_command(command: str) -> None:
-    """Issue a one-time confirmation token for a specific command string."""
+# Script fingerprints recorded alongside a token when the confirmed command
+# is an approval-gated script run (see SCRIPT_RUNNERS). Key: exact command
+# string. Value: fingerprint of the script file(s) AT THE MOMENT THE DIALOG
+# WAS SHOWN. Checked again when the token is consumed, so a script edited
+# between "user approved" and "command runs" does not run on the old approval.
+_confirmed_script_fingerprints: dict[str, str] = {}
+
+
+def register_confirmed_command(command: str, script_fp: Optional[str] = None) -> None:
+    """Issue a one-time confirmation token for a specific command string.
+
+    script_fp is the script_fingerprint() taken when the dialog was shown;
+    pass it for script runs so the approval is bound to that file content."""
     _confirmed_destructive[command] = True
+    if script_fp is not None:
+        _confirmed_script_fingerprints[command] = script_fp
+    else:
+        _confirmed_script_fingerprints.pop(command, None)
 
 
 def consume_confirmed_command(command: str) -> bool:
-    """Check and consume a confirmation token. Returns True if confirmed, False otherwise."""
-    return _confirmed_destructive.pop(command, False)
+    """Check and consume a confirmation token. Returns True if confirmed, False otherwise.
+
+    For a script run the token is only honoured if the script file(s) still
+    match the fingerprint recorded at approval time. A mismatch (or a script
+    run with no recorded fingerprint) burns the token and returns False, so
+    the caller answers "needs confirmation" and the user is asked again about
+    the NEW content."""
+    if not _confirmed_destructive.pop(command, False):
+        return False
+    expected = _confirmed_script_fingerprints.pop(command, None)
+    try:
+        current = script_fingerprint(command)
+    except OSError:
+        return False
+    return current == expected
 
 
 # ---------------------------------------------------------------------------
@@ -267,8 +296,104 @@ def _segment_binary(segment: list[str]) -> tuple[Optional[str], list[str]]:
     return None, []
 
 
-def command_is_destructive(command: str) -> bool:
-    """Return True if command matches a known irreversible destructive pattern.
+# ---------------------------------------------------------------------------
+# Approval-gated shell script runs
+# ---------------------------------------------------------------------------
+# REMOVE THIS SET IN ONE EDIT (delete it and the `| SCRIPT_RUNNERS` on the
+# WHITELIST line) to hard-ban shell scripts again.
+#
+# `bash /abs/path/script.sh [args]` may be ATTEMPTED (it is on the whitelist),
+# but command_is_destructive() flags every such run, so it cannot execute
+# without a one-time lc_confirm_destructive token — per run, per exact command
+# string, bound to the script's content. Same contract as DISK_TOOLS.
+#
+# Still hard-banned at the pre-filter (see _script_run_blocked):
+#   - `bash -c ...` and EVERY other bash flag (-s, -i, --rcfile, ...)
+#   - bare `bash` (interactive / reads stdin, so `cat x | bash` is dead too)
+#   - relative script paths (the dialog must show exactly which file runs)
+#   - scripts under /tmp, /var/tmp, /dev/shm or the scratchpad
+#   - sh / perl / ruby — not on the whitelist at all
+SCRIPT_RUNNERS: frozenset[str] = frozenset({"bash"})
+
+
+def script_run_targets(command: str) -> list[str]:
+    """Script paths run by an approval-gated script runner in this command.
+
+    One entry per segment whose binary is in SCRIPT_RUNNERS. Empty list when
+    the command runs no script."""
+    targets: list[str] = []
+    for segment in _split_segments(_lex(os.path.expanduser(command))):
+        binary, args = _segment_binary(segment)
+        if binary in SCRIPT_RUNNERS and args:
+            targets.append(args[0])
+    return targets
+
+
+def script_fingerprint(command: str) -> Optional[str]:
+    """SHA-256 over the resolved path + content of every script the command
+    runs. None if the command runs no script. Raises OSError if a script
+    cannot be read (missing, a directory, no permission).
+
+    Known limit: covers the script file itself, not files it sources or
+    calls."""
+    targets = script_run_targets(command)
+    if not targets:
+        return None
+    h = hashlib.sha256()
+    for target in targets:
+        path = pathlib.Path(target).resolve()
+        h.update(str(path).encode())
+        h.update(b"\0")
+        h.update(path.read_bytes())
+        h.update(b"\0")
+    return h.hexdigest()
+
+
+def _script_run_blocked(args: list[str]) -> str | None:
+    """Pre-filter shape check for a SCRIPT_RUNNERS binary. `args` is everything
+    after the binary. Returns an error string, or None on pass.
+
+    The ONLY admissible shape is `bash /absolute/path/to/script [script args]`.
+    Anything after the script path belongs to the script, not to bash."""
+    if not args:
+        return (
+            "bare `bash` is not permitted (interactive shell / reads commands "
+            "from stdin). Only `bash /absolute/path/script.sh [args]` is allowed."
+        )
+    script = args[0]
+    if script.startswith("-"):
+        return (
+            f"bash flags are not permitted: {script} (this includes -c). "
+            f"Only `bash /absolute/path/script.sh [args]` is allowed."
+        )
+    if not script.startswith("/"):
+        return (
+            f"bash script path must be absolute: {script!r}. Use the full path "
+            f"so the approval dialog shows exactly which file will run."
+        )
+    try:
+        resolved = pathlib.Path(script).resolve()
+    except Exception:
+        return f"Script path could not be resolved: {script!r}"
+    for restricted in _RESTRICTED_SCRIPT_DIRS:
+        try:
+            resolved.relative_to(restricted.resolve())
+        except ValueError:
+            continue
+        return (
+            f"BLOCKED: executing a script from '{restricted}' is not permitted. "
+            f"Shell scripts in writable or temporary directories cannot be run, "
+            f"with or without approval."
+        )
+    return None
+
+
+def command_is_destructive(command: str, include_script_runs: bool = True) -> bool:
+    """Return True if command must pass the confirmation wall: a known
+    irreversible destructive pattern, or an approval-gated shell script run
+    (SCRIPT_RUNNERS — not destructive as such, but it executes arbitrary code,
+    so it shares the same per-command approval gate). Pass
+    include_script_runs=False to ask only "is this destructive in itself?".
 
     Checks, per segment (segments split on | || && ; &):
     - dd, mkfs*, shred, wipefs etc. as the segment's BINARY
@@ -315,6 +440,10 @@ def command_is_destructive(command: str) -> bool:
         # approval: the confirm token is keyed on the exact command string,
         # so approving one delete never widens to a folder or a session.
         if binary == "rm":
+            return True
+
+        # Shell script runs: approval-gated, every run. See SCRIPT_RUNNERS.
+        if include_script_runs and binary in SCRIPT_RUNNERS:
             return True
 
     # Catch redirections to actual block devices only — NOT /dev/null, /dev/stdout etc.
@@ -545,9 +674,11 @@ def _script_path_blocked(tokens: list[str]) -> str | None:
 #   nc / netcat / ncat / socat / curl / wget — also blocked by command_has_network_exfil
 #   dd / mkfs.* / shred / wipefs — destructive; excluded by design
 #   rm — now on WHITELIST; rm -r / rm -rf still caught by the destructive wall
-#   bash / sh / perl / ruby           — interpreter -c/-e flags would bypass the
+#   sh / perl / ruby                  — interpreter -c/-e flags would bypass the
 #       whitelist. DANGEROUS_FLAGS entries exist as defence-in-depth but the
 #       binaries themselves are not whitelisted, so they cannot be invoked.
+#   bash — NOT in this set; added via SCRIPT_RUNNERS below, script-file form
+#       only, and every run needs an lc_confirm_destructive token.
 WHITELIST: frozenset[str] = frozenset({
     # Filesystem read
     "ls", "cat", "head", "tail", "find", "stat", "file", "wc",
@@ -638,7 +769,7 @@ DISK_TOOLS: frozenset[str] = frozenset({
     "e2label", "tune2fs", "resize2fs", "udisksctl",
 })
 
-WHITELIST = WHITELIST | DISK_TOOLS
+WHITELIST = WHITELIST | DISK_TOOLS | SCRIPT_RUNNERS
 
 
 # Per-binary banned flag tokens.
@@ -915,6 +1046,13 @@ def _vet_command(tokens: list[str]) -> FilterResult:
             if arg in banned or arg.split("=", 1)[0] in banned:
                 return _pf_fail(f"Dangerous flag for {binary}: {arg}")
 
+    # Shell script runner shape gate — script-file form only, absolute path,
+    # no flags, not from temp / writable directories.
+    if binary in SCRIPT_RUNNERS:
+        runner_err = _script_run_blocked(args)
+        if runner_err:
+            return _pf_fail(runner_err)
+
     # Interpreter script-path gate — blocks execution of scripts dropped into
     # temp / writable directories (e.g. lc_write_file → python3 /tmp/x.py).
     script_err = _script_path_blocked(tokens[idx:])
@@ -1135,10 +1273,12 @@ async def execute_command(
                 "exit_code": -1,
                 "stdout": "",
                 "stderr": (
-                    "BLOCKED: All destructive commands require explicit user confirmation first.\n"
+                    "BLOCKED: Destructive commands and shell script runs require explicit user confirmation first.\n"
                     "You MUST call lc_confirm_destructive before lc_exec_command with:\n"
                     "  - command: the exact command string (must match precisely)\n"
-                    "  - description: plain English description of exactly what will be permanently destroyed\n"
+                    "  - description: plain English description of exactly what will be permanently destroyed,\n"
+                    "    or for `bash /path/script.sh` what the script does\n"
+                    "A script approval is void if the script file changes before it runs.\n"
                     "The user will see a confirmation dialog. Only if they approve will a token be issued.\n"
                     "Do NOT attempt to bypass this gate or find alternative commands."
                 ),

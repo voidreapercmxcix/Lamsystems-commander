@@ -447,11 +447,24 @@ list is curated for an AI-orchestration and model-tuning workflow.
 | `dd`, `mkfs.*`, `shred`, `wipefs` | Destructive — irreversible data loss |
 | `ssh`, `scp`, `sftp`, `rsync` | Layer 3 SSH gate — exfil / C2 vectors |
 | `nc`, `netcat`, `ncat`, `socat`, `curl`, `wget` | Layer 3 network exfil gate |
-| `bash`, `sh`, `perl`, `ruby` | Their `-c` / `-e` flags would bypass the whitelist entirely |
+| `sh`, `perl`, `ruby` | Their `-c` / `-e` flags would bypass the whitelist entirely |
 
 `DANGEROUS_FLAGS` entries for `bash`, `sh`, `perl`, and `ruby` exist as
 defence-in-depth — if those binaries are ever added to WHITELIST in future,
 the `-c` / `-e` block is already in place.
+
+**`bash` is on the WHITELIST but approval-gated (`SCRIPT_RUNNERS`).** The only
+admissible form is `bash /absolute/path/script.sh [args]`. `bash -c` and every
+other bash flag, bare `bash` (so `cat x | bash` too), relative script paths,
+and scripts under `/tmp`, `/var/tmp`, `/dev/shm` or `~/.commander_workspace`
+are rejected at the pre-filter. Every admissible run is flagged by
+`command_is_destructive`, so it needs a one-time `lc_confirm_destructive`
+token: the dialog shows the script path and a content hash, and the token is
+bound to that content — if the script file changes between approval and
+execution the token is void and the user is asked again. The hash covers the
+script file itself, not files it sources or calls. Declining blocks that exact
+command for the rest of the session. To hard-ban shell scripts again, delete
+`SCRIPT_RUNNERS` and the `| SCRIPT_RUNNERS` on the WHITELIST line in `shell.py`.
 
 **`find` is on the WHITELIST but gated:** `-delete`, `-exec`, and `-execdir`
 are blocked via `DANGEROUS_FLAGS`. Normal use (`find /path -name '*.log'`) works;

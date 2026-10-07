@@ -45,6 +45,9 @@ from lamsystems_commander.shell import (
     command_requires_ssh_gate,
     command_has_network_exfil,
     command_is_destructive,
+    register_confirmed_command,
+    consume_confirmed_command,
+    script_fingerprint,
     WHITELIST,
     DANGEROUS_FLAGS,
 )
@@ -87,6 +90,28 @@ CASES = [
     # ---- Should FAIL the pre-filter (security cases) ----
     ('python3 -c "import os; os.system(\'id\')"',  "fail_prefilter"),
     ('bash -c "echo pwned"',                       "fail_prefilter"),
+    # ---- bash: script-file form only, and always behind the approval wall ----
+    ("bash /home/user/proj/install.sh",            "destructive"),
+    ("bash /home/user/proj/install.sh --user -y",  "destructive"),
+    ("sudo bash /home/user/proj/install.sh",       "destructive"),
+    ("uv run bash /home/user/proj/x.sh",           "destructive"),
+    ("timeout 60 bash /home/user/proj/x.sh",       "destructive"),
+    ("ls && bash /home/user/proj/x.sh",            "destructive"),
+    ("bash /home/user/proj/x.sh | tee out.log",    "destructive"),
+    ("bash",                                       "fail_prefilter"),
+    ("bash -c id",                                 "fail_prefilter"),
+    ("bash -s",                                    "fail_prefilter"),
+    ("bash -x /home/user/proj/x.sh",               "fail_prefilter"),
+    ("bash --rcfile /home/user/a /home/user/b.sh", "fail_prefilter"),
+    ("bash install.sh",                            "fail_prefilter"),
+    ("bash ./install.sh",                          "fail_prefilter"),
+    ("bash /tmp/x.sh",                             "fail_prefilter"),
+    ("bash /var/tmp/x.sh",                         "fail_prefilter"),
+    ("bash /dev/shm/x.sh",                         "fail_prefilter"),
+    ("cat /home/user/proj/x.sh | bash",            "fail_prefilter"),
+    ("sh /home/user/proj/x.sh",                    "fail_prefilter"),
+    ("/usr/bin/bash /home/user/proj/x.sh",         "fail_prefilter"),
+    ("echo bash",                                  "pass"),
     ("ls $(whoami)",                               "fail_prefilter"),
     ("ls `whoami`",                                "fail_prefilter"),
     ("ls > /tmp/out",                              "fail_prefilter"),
@@ -175,7 +200,57 @@ def main() -> int:
         print(f"{expected:16}  {actual:16}  {marker}   {display}")
     print()
     print(f"{len(CASES) - fails}/{len(CASES)} tests pass")
-    return 1 if fails else 0
+
+    token_fails = token_tests()
+    return 1 if (fails or token_fails) else 0
+
+
+def token_tests() -> int:
+    """Approval-token behaviour for script runs: the token is one-time and is
+    bound to the script content that existed when it was approved."""
+    import tempfile
+    results: list[tuple[str, bool]] = []
+    with tempfile.TemporaryDirectory() as d:
+        script = pathlib.Path(d) / "install.sh"
+        script.write_text("echo one\n")
+        cmd = f"bash {script}"
+
+        results.append(("no token -> refused", consume_confirmed_command(cmd) is False))
+
+        register_confirmed_command(cmd, script_fingerprint(cmd))
+        results.append(("approved, unchanged -> runs", consume_confirmed_command(cmd) is True))
+        results.append(("token is one-time", consume_confirmed_command(cmd) is False))
+
+        register_confirmed_command(cmd, script_fingerprint(cmd))
+        script.write_text("echo two\n")
+        results.append(("script edited after approval -> refused", consume_confirmed_command(cmd) is False))
+
+        register_confirmed_command(cmd)  # token with no fingerprint
+        results.append(("script token without fingerprint -> refused", consume_confirmed_command(cmd) is False))
+
+        register_confirmed_command(cmd, script_fingerprint(cmd))
+        script.unlink()
+        results.append(("script deleted after approval -> refused", consume_confirmed_command(cmd) is False))
+
+        missing_raises = False
+        try:
+            script_fingerprint(cmd)
+        except OSError:
+            missing_raises = True
+        results.append(("missing script cannot be fingerprinted", missing_raises))
+
+    register_confirmed_command("rm /nonexistent/x")
+    results.append(("non-script token unaffected", consume_confirmed_command("rm /nonexistent/x") is True))
+    results.append(("non-script command has no fingerprint", script_fingerprint("ls -la") is None))
+
+    print()
+    fails = 0
+    for label, ok in results:
+        if not ok:
+            fails += 1
+        print(f"{'ok  ' if ok else 'FAIL'}  {label}")
+    print(f"{len(results) - fails}/{len(results)} token tests pass")
+    return fails
 
 
 if __name__ == "__main__":
