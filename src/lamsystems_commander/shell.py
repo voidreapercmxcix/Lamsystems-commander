@@ -717,8 +717,13 @@ WHITELIST: frozenset[str] = frozenset({
     # pytest is read-only; rail is the user's own CLI.
     "pytest", "rail",
     # Dev tools
-    "git", "make", "cmake", "gcc", "g++", "clang", "clang++",
+    "git", "make", "cmake", "ninja", "gcc", "g++", "clang", "clang++",
     "ld", "ar", "nm", "objdump", "ldd", "pkg-config",
+    # Rust toolchain (Fedora rpm; no rustup). cargo build/run/test execute
+    # build.rs and proc-macros - the same arbitrary-code surface `make`
+    # already has. Registry / global-install subcommands blocked via
+    # DANGEROUS_FLAGS.
+    "cargo", "rustc",
     # Language runtimes (-c / -e blocked via DANGEROUS_FLAGS)
     "python", "python3", "node",
     # JS package managers (install / exec blocked via DANGEROUS_FLAGS)
@@ -806,11 +811,23 @@ DANGEROUS_FLAGS: dict[str, frozenset[str]] = {
         "self", "tool", "clean",
         "--with", "--with-requirements", "--with-editable",
     }),
-    # JS package managers — install/exec run arbitrary code from registry
+    # JS package managers — install/exec pull and run code from the registry.
+    # `npm run <script>` / `npm test` run project-local package.json scripts,
+    # which is the same surface as `make` / `cargo build` and is what a build
+    # actually needs, so it is allowed.
     "npm":  frozenset({"install", "i", "uninstall", "remove", "rm",
-                       "exec", "x", "run", "run-script"}),
-    "yarn": frozenset({"add", "remove", "install"}),
-    "pnpm": frozenset({"install", "i", "add", "remove", "rm"}),
+                       "exec", "x"}),
+    "yarn": frozenset({"add", "remove", "install", "dlx"}),
+    "pnpm": frozenset({"install", "i", "add", "remove", "rm", "dlx", "exec"}),
+    # cargo — build/check/test/run/clippy/fmt/doc/clean/tree/metadata allowed.
+    # Anything that writes outside the project (install to ~/.cargo/bin),
+    # talks to the registry as a publisher, or edits Cargo.toml deps is
+    # blocked. Note `cargo build` still fetches crates on first build; that is
+    # inherent to Rust and is accepted.
+    "cargo": frozenset({
+        "install", "uninstall", "publish", "login", "logout", "owner",
+        "yank", "add", "remove", "rm",
+    }),
     # Health-diagnostic binaries: read-only use is allowed, but their write /
     # destructive subcommands and flags are blocked here (belt-and-braces; the
     # truly destructive ones also need root and hit the sudo gate anyway).

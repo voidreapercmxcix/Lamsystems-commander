@@ -433,10 +433,15 @@ list is curated for an AI-orchestration and model-tuning workflow.
   `nohup`, `time`, `timeout`, `watch`
 - **Package info (write subcommands blocked):** `dnf`, `rpm`, `pip`, `pip3`, `uv`
 - **Project tooling via `uv run`:** `pytest`, `rail`
-- **Dev tools:** `git`, `make`, `cmake`, `gcc`, `g++`, `clang`, `clang++`,
+- **Dev tools:** `git`, `make`, `cmake`, `ninja`, `gcc`, `g++`, `clang`, `clang++`,
   `ld`, `ar`, `nm`, `objdump`, `ldd`, `pkg-config`
+- **Rust toolchain:** `cargo`, `rustc` — `build` / `check` / `test` / `run` /
+  `clippy` / `fmt` / `doc` / `clean` / `tree` / `metadata` allowed;
+  `install` / `uninstall` / `publish` / `login` / `logout` / `owner` / `yank` /
+  `add` / `remove` blocked
 - **Language runtimes (`-c` / `-e` blocked):** `python`, `python3`, `node`
-- **JS package managers (install / exec blocked):** `npm`, `yarn`, `pnpm`
+- **JS package managers (install / exec / dlx blocked; `run` / `test` allowed):**
+  `npm`, `yarn`, `pnpm`
 - **Misc:** `which`, `whereis`, `type`, `echo`, `printf`, `date`, `sleep`,
   `env`, `true`, `false`, `yes`, `seq`, `man`, `less`, `more`
 
