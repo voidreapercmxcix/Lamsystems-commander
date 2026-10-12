@@ -224,6 +224,14 @@ CASES = [
     ("pnpm exec vite",                             "fail_prefilter"),
     ("yarn add lodash",                            "fail_prefilter"),
     ("yarn dlx create-vite",                       "fail_prefilter"),
+    # gh — full access on the Claude-only commander
+    ("gh auth status",                             "pass"),
+    ("gh repo create lam/x --private --source .",  "pass"),
+    ("gh pr create -t title -b body",              "pass"),
+    ("gh pr list",                                 "pass"),
+    ("gh run watch",                               "pass"),
+    ("gh api repos/lam/x",                         "pass"),
+    ("gh release create v1 dist/app.tar.gz",       "pass"),
     # ninja (cmake -G Ninja builds)
     ("ninja -C build",                             "pass"),
     # still-excluded toolchains

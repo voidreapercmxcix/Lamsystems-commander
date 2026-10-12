@@ -724,6 +724,10 @@ WHITELIST: frozenset[str] = frozenset({
     # already has. Registry / global-install subcommands blocked via
     # DANGEROUS_FLAGS.
     "cargo", "rustc",
+    # GitHub CLI. This is the Claude-only commander: gh is a trusted dev tool
+    # like git, so no subcommand bans. Destructive wall and sudo gate still
+    # apply as for everything else.
+    "gh",
     # Language runtimes (-c / -e blocked via DANGEROUS_FLAGS)
     "python", "python3", "node",
     # JS package managers (install / exec blocked via DANGEROUS_FLAGS)

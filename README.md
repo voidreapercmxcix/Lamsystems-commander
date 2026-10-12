@@ -439,6 +439,7 @@ list is curated for an AI-orchestration and model-tuning workflow.
   `clippy` / `fmt` / `doc` / `clean` / `tree` / `metadata` allowed;
   `install` / `uninstall` / `publish` / `login` / `logout` / `owner` / `yank` /
   `add` / `remove` blocked
+- **GitHub CLI:** `gh` — full access (trusted dev tool on the Claude-only build)
 - **Language runtimes (`-c` / `-e` blocked):** `python`, `python3`, `node`
 - **JS package managers (install / exec / dlx blocked; `run` / `test` allowed):**
   `npm`, `yarn`, `pnpm`
