@@ -1,26 +1,29 @@
 # Lamsystems-commander
 
-A safety-first, self-hosted **MCP server** that gives an AI assistant shell,
-file, search, process and git access to your machine — a Desktop
-Commander-style tool surface inside a strict, layered safety architecture:
-a stateless pre-filter pipeline, a hard-coded binary allowlist, wrapper-aware
-vetting (`sudo`, `env`, `timeout`, `uv run` …), SSH and network-exfil blocks,
-file-tool write guards, destructive-command confirmation, and a sudo gate.
-None of these layers can be bypassed by model behaviour alone.
+A self-hosted **MCP server** that gives Claude shell, file, search, process
+and git access to your machine — a Desktop Commander-style tool surface with
+two hard gates the model cannot bypass: **destructive-command confirmation**
+and a **sudo password gate**. Plus file-tool write guards for system paths
+and the server's own source.
 
-Works with Claude (Desktop, Cowork, Claude Code), LM Studio, and any other
-MCP client. Local only: no account, no hosted relay, no per-call metering.
+**This is the Claude-only build.** It trusts the model as a developer: any
+installed binary runs, pipes/redirects/globs work, package managers install,
+`curl`/`ssh`/`gh` are open. The hostile-model stack (strict binary allowlist,
+dangerous-flag bans, SSH and network-exfil blocks, injection and traversal
+checks, no-inline-code rules) lives in the sibling project
+**Lmstudio-commander**, which is the one to run behind a local model. Do not
+point a local, abliterated or untrusted model at this build.
+
+Local only: no account, no hosted relay, no per-call metering.
 Written in Python with FastMCP. MIT licensed.
 
 > Developed on Fedora. Tested on Python 3.10+. Linux-first; the sudo dialogs
 > use GNOME/KDE tooling, everything else is portable.
 >
-> **Default posture is restrictive.** Out of the box the server runs in strict
-> allowlist mode: only binaries on the WHITELIST will execute. Many commands
-> that work in a normal shell — including `curl`, `wget`, `ssh`,
-> `python3 -c …`, `dnf install` — are rejected by design. See
-> [Strict allowlist mode](#strict-allowlist-mode) below if you need to extend
-> the whitelist for your own setup.
+> **Posture: trusted developer shell.** Any installed binary runs. The only
+> things that stop a command are the destructive-command dialog, the sudo
+> dialog, and the handful of pre-filter shapes listed under
+> [Safety architecture](#safety-architecture-claude-only-build).
 
 ---
 
@@ -28,9 +31,11 @@ Written in Python with FastMCP. MIT licensed.
 
 **Read this before you do anything else.**
 
-This server gives a local LLM full shell access to your machine as your user.
-If you use an abliterated or uncensored model, it **WILL** execute destructive
-commands without hesitation if instructed to do so.
+This build gives the model full shell access to your machine as your user,
+with only the destructive-command dialog and the sudo dialog standing between
+a command and execution. That is the right trade for Claude. It is the wrong
+trade for a local, abliterated or uncensored model, which **WILL** execute
+anything it is told — use Lmstudio-commander for those.
 
 We tested this. A fully abliterated model:
 - Identified the system drive (`/dev/nvme0n1`, 931.5 GB)
@@ -64,9 +69,9 @@ licensed too. The difference is posture, not price:
 | | Desktop Commander (local) | Lamsystems-commander |
 |---|---|---|
 | Tool surface | terminal, files, search, edit_block, processes, PDF write, usage analytics | shell, files, search, edit_block, processes, git, scratchpad |
-| Shell policy | full shell; `blockedCommands` blocklist "for accidental execution" | **strict allowlist**; everything not listed is rejected before a shell exists |
-| Wrapper handling | not documented | `sudo`, `env`, `nice`, `timeout`, `uv run` etc. are unwrapped and the real binary is vetted |
-| Interpreter escape hatches | not documented | `python -c`, `node -e`, `find -exec`, package-manager installs blocked per binary |
+| Shell policy | full shell; `blockedCommands` blocklist "for accidental execution" | full shell; **destructive wall** with per-command, one-time approval tokens, bound to script content for script runs |
+| Wrapper handling | not documented | `sudo`, `env`, `nice`, `timeout`, `uv run` etc. are unwrapped so the real binary hits the destructive wall |
+| Interpreter escape hatches | not documented | `bash -c`, bare `bash`, `$(...)` rejected so the script-approval and destructive gates cannot be dodged; everything else open |
 | Destructive commands | no approval step documented; README says "not a sandbox" | hard wall + one-time confirmation token via a dialog you click |
 | Sudo | not documented | fresh approval per call through MCP elicitation / zenity / kdialog / pkexec; opt-in session cache for non-destructive commands only |
 | Pipes / redirects / subshells | standard shell | blocked; scratchpad pattern instead |
@@ -137,7 +142,7 @@ the venv (see `examples/mcp_config.json`):
 - **LM Studio:** add the entry to `~/.lmstudio/mcp.json` or the in-app MCP settings.
 
 The `lc_*` tools should appear in the tool list. `lc_exec_command`'s
-description lists the current allowlist so the model doesn't have to guess.
+description states the two gates so the model doesn't have to guess.
 
 ### Approval prompts (client side)
 
@@ -154,8 +159,8 @@ destructive and will keep prompting even after you pick "Always allow":
 Everything else — read, write, edit, move, mkdir, shell commands, process
 sessions, search, git — is declared non-destructive so "Always allow" sticks.
 That is safe because the protection lives in the server, not the dialog:
-`lc_exec_command` still runs every command through the pre-filter, the
-allowlist, the network/SSH gate and the destructive hard wall, and
+`lc_exec_command` still runs every command through the pre-filter and the
+destructive hard wall, and
 `lc_write_file`/`lc_edit_block` still go through `_file_guard()`. Turning the
 client prompt off changes nothing about what the server will refuse.
 
@@ -176,12 +181,10 @@ Add this to your model's system prompt (Claude's project instructions, or
 the LM Studio system prompt):
 
 ```
-This server enforces a strict binary allowlist (the pre-filter pipeline).
-Commands using binaries not on the WHITELIST will be rejected with a clear
-stderr message. Read the rejection reason and try a different approach —
-do not repeatedly retry the same blocked command.
+This server runs commands as a normal shell. If a command is rejected, read
+the stderr reason and change the approach — do not retry the same string.
 
-There are multiple safety layers including destructive-command confirmation
+There are two safety gates: destructive-command confirmation
 and sudo approval. Follow those mechanisms exactly and never attempt to
 circumvent them.
 You must NEVER attempt to bypass, circumvent, or find alternatives to the sudo
@@ -211,290 +214,79 @@ may trigger unexpected behaviour.
 
 ---
 
-## Safety architecture
+## Safety architecture (Claude-only build)
 
-Six independent layers protect against destructive or exfiltrating actions.
-Every shell command passes through Layer 1 first; the others fire after, in
-order, and any single layer is enough to block a command on its own.
+Two gates. Both fire on `lc_exec_command` and `lc_start_process` alike; a
+gate that one tool enforces and another ignores is not a gate.
 
-### Layer 1 — Pre-filter pipeline (Python, stateless)
+### Gate 1 — Destructive command wall + confirmation dialog
 
-Every command entering `lc_exec_command` **and** `lc_start_process` is vetted
-before anything else runs. The filter is a single stateless function — no
-sessions, no caches, no timing windows — and it operates on the raw command
-string before any shell or subprocess is created.
+`command_is_destructive()` scans every segment of the command (split on
+`|`, `||`, `&&`, `;`, `&`) and looks at the **binary position** of each —
+never at arguments, so `ls /sbin/mkfs` and `man mkfs` are not flagged.
+It fires on:
 
-The pipeline runs six passes:
+- `rm` — every form, single file or recursive
+- `dd`, `shred`, `wipefs`, `blkdiscard`, `mkfs*`, `mkswap`
+- partition editors (`fdisk`, `sfdisk`, `sgdisk`, `gdisk`, `cfdisk`,
+  `parted`, …) unless called in a pure listing mode (`fdisk -l`)
+- `nvme format` / `sanitize` / `delete-ns` / `write` / `write-zeroes` /
+  `fw-commit` / `fw-download`
+- redirects onto a block device (`> /dev/sda`, `> /dev/nvme0n1`)
+- **every shell-script run**: `bash|sh|zsh|dash|ksh /absolute/path.sh`
 
-0. **Tilde expansion.** `~` is expanded to the real home directory path before
-   any further processing. This ensures that `rm -rf ~/foo` and
-   `rm -rf /home/user/foo` are always treated as the same command — preventing
-   a model from using path format switching to escape the session decline cache.
-1. **Raw-string scan.** Hard-rejects any input containing `$(` or backticks.
-   Subshells and command substitution would let the model construct a payload
-   that the structural tokeniser cannot see, so they are killed at the source.
-2. **Tokenisation.** The command is parsed with Python's `shlex` lexer (POSIX
-   mode). Malformed quoting raises a clean `ValueError` and rejects the
-   command. No regex, no hand-rolled parser.
-3. **Hard-banned operators.** Pipes (`|`), redirects (`>`, `>>`, `<`) anywhere
-   in the token list reject the entire command. The scratchpad replaces pipes
-   for inter-command data flow; redirects bypass the audit trail.
-4. **Sequence splitting.** `&&`, `||`, and `;` split the command into atomic
-   blocks. Each block is vetted independently. Any block failing rejects the
-   whole compound — never partial admit.
-5. **Per-block vetting:**
-   - **Strict allowlist.** The block's binary must be on the WHITELIST. Exact
-     match on the binary name. See [Strict allowlist mode](#strict-allowlist-mode)
-     for the full list and how to extend it.
-   - **Injection-character scan.** Arguments containing `; & | $ ( ) \``
-     are rejected. (Redirect characters are already caught upstream.)
-   - **Path traversal.** Component-level check — `..` appearing as a standalone
-     path component (`ls ..`, `cat foo/..`, `cat ../../etc/passwd`) is rejected.
-   - **Per-binary dangerous flags.** A dictionary blocks the most dangerous
-     flags per binary. Key entries:
-     - `-c` / `-e` for interpreters — blocks inline code execution
-     - `-delete`, `-exec`, `-execdir` for `find` — blocks mass deletion and
-       arbitrary command execution via find
-     - Write subcommands for package managers (`dnf install`, `pip install`, etc.)
-   - **Interpreter script-path gate.** When the binary is a known interpreter
-     (`python`, `python3`, `node`), any argument that looks like a file path is
-     checked against a list of restricted directories (`/tmp`, `/var/tmp`,
-     `/dev/shm`, `~/.commander_workspace`). Scripts dropped into writable or
-     temporary directories cannot be executed. Scripts in project directories
-     are unaffected.
+Wrappers are unwrapped first, so `sudo rm`, `nice -n 5 mkfs.ext4`,
+`timeout 30 dd`, `uv run bash x.sh` are all caught.
 
-Reject reasons surface in `stderr` so the model knows exactly why a command
-was refused.
+A flagged command is refused until the model calls `lc_confirm_destructive`
+with the **exact** command string and a plain-English description. You see a
+GUI dialog (zenity/kdialog) or an MCP elicitation; approving issues a
+one-time token bound to that string. Script runs are additionally bound to a
+SHA-256 of the script's resolved path and content — edit the file after
+approval and the token is void. A declined command stays declined for the
+session.
 
-### Layer 1b — Process launch gate (`command_gate`, Python)
+### Gate 2 — Sudo
 
-`lc_start_process` runs every command through the same full gate stack as
-`lc_exec_command` — pre-filter pipeline, SSH gate, network exfil gate, and
-file integrity check — before any subprocess is created. Compound commands
-(`&&`, `||`, `;`) are additionally rejected in process sessions: one atomic
-command per session only.
+Any block containing `sudo` goes through the approval chain described under
+"How the sudo gate works" below. Unchanged from the hostile-model build.
 
-Subprocess creation uses `create_subprocess_exec` with the vetted token list
-directly, not `create_subprocess_shell`. There is no shell expansion at launch
-time — the model cannot inject shell metacharacters via the process path.
+### What the pre-filter still rejects
 
-### Layer 2 — File integrity and write protection (Python)
+Three things, none of them about trust:
 
-Two independent checks applied to every write operation:
+- **`$(...)` and backticks** — the destructive wall cannot see inside a
+  substitution, so `echo $(rm -rf x)` would run `rm` with no dialog. Run the
+  inner command as its own step.
+- **Shell-script shape** — `bash -c …`, bare `bash` (reads stdin, so
+  `cat x | bash` and `bash < x` too), relative script paths. These would
+  dodge the per-file approval token. Inline code in *other* interpreters
+  (`python3 -c`, `node -e`) is fine.
+- **Malformed quoting** — shlex has to be able to tokenise it.
 
-**Shell-level (lc_exec_command):** Any command referencing the server's own
-source directory is blocked before execution. A model cannot use shell commands
-to overwrite its own safety constraints or blocklists.
+### File-tool guards (unchanged)
 
-**File-tool-level (lc_write_file, lc_edit_block, lc_move_file):** A
-`_file_guard()` check runs before every mutating file operation and blocks:
+- `lc_write_file` / `lc_edit_block` / `lc_move_file` / `lc_create_directory`
+  refuse system paths (`/etc`, `/usr`, `/boot`, …) — use `sudo` via
+  `lc_exec_command` instead, which puts a dialog in front of it.
+- Every tool refuses to touch the commander's own source directory. The model
+  cannot edit its own gates.
 
-- Writes to the server source directory — same protection as the shell-level check
-- Writes to system paths: `/etc`, `/usr`, `/bin`, `/sbin`, `/lib`, `/lib64`,
-  `/boot`, `/sys`, `/proc`, `/dev`, `/run`
+### Execution model
 
-This closes the `lc_write_file` → script execution gap where a model could
-write a Python script to a temp directory and execute it via `python3 script.py`
-to work around the shell-level protections. System paths and server source are
-now protected at the file tool level regardless of which tool is used.
+The command string is split on `&&` / `||` / `;` (quote- and escape-aware,
+so `find -exec … \;`, `2>&1` and `echo 'a && b'` stay intact) and each block
+runs through the shell verbatim. `&&` / `||` semantics are honoured across
+blocks; `sudo` is resolved per block; a timeout stops the sequence.
+`lc_start_process` runs the whole string in one shell for background jobs.
 
-The interpreter script-path gate in Layer 1 adds a second line of defence: even
-if a script is written to `/tmp` via some other route, executing it via
-`python3 /tmp/script.py` is blocked at the pre-filter before any subprocess is
-created.
+### What is NOT enforced on this build
 
-> **Remaining gap:** the dedicated low-privilege user (see roadmap) is the
-> complete architectural fix. Until then, writes to user home subdirectories
-> outside the restricted list are not blocked at the file tool level.
-
-### Layer 3 — SSH and network exfil gate (Python)
-
-Two unconditional blocks enforced before any command runs:
-
-- **SSH gate:** `ssh`, `scp`, `sftp`, and `rsync` are blocked. Models cannot
-  open outbound tunnels, copy files to remote hosts, or use rsync over SSH.
-  These are C2 and exfil vectors regardless of stated intent.
-
-- **Network exfil gate:** `nc`, `netcat`, `ncat`, `socat`, `curl`, and `wget`
-  are blocked. Raw TCP/UDP relay and HTTP data transfer tools are disabled at
-  the architectural level.
-
-In practice these binaries are also off the WHITELIST, so they fail at Layer 1
-first. The dedicated gates remain in place as defence-in-depth — if the
-allowlist is ever extended, the SSH and exfil blocks still hold.
-
-Both gates also apply to `lc_start_process` via `command_gate`.
-
-### Layer 4 — Destructive command hard wall (Python)
-
-`lc_exec_command` tokenises every command and scans **the entire pipeline**
-before execution — not just the first binary. All segments of a chained
-command are checked.
-
-Commands matching destructive patterns (any `rm`, `dd`, `mkfs`, `shred`,
-`wipefs`, writes to block devices) are blocked regardless of sudo. A safe
-binary earlier in the pipeline (e.g. `cat`, `ls`, `echo`) does not protect
-destructive operations in later segments. The model must call
-`lc_confirm_destructive` first.
-
-### Layer 5 — Destructive confirmation dialog (`lc_confirm_destructive`)
-
-Before any destructive command can run, the model must call `lc_confirm_destructive`
-with the exact command and a plain-English description of what will be destroyed.
-This fires an in-app elicitation dialog (or a zenity / kdialog fallback) showing
-exactly what will be permanently lost. A one-time token is issued only on
-explicit approval.
-
-**A dialog that cannot be shown is not a decline.** MCP clients launch the
-server with a clean environment (no `DISPLAY`, `WAYLAND_DISPLAY` or
-`XDG_RUNTIME_DIR`), so the server discovers the session's display from
-`/run/user/<uid>/wayland-*` and `/tmp/.X11-unix` itself. If no dialog can be
-shown at all, or it times out, the tool reports that loudly, issues no token,
-and records nothing — only a real click on Cancel goes into the session decline
-cache. Claude Desktop / Cowork do not currently support elicitation, so on
-those clients the GUI fallback is the path that runs.
-
-**Token normalisation:** Both `lc_confirm_destructive` and the exec path expand
-`~` to the real home directory before registering or checking tokens. A model
-cannot escape a decline by switching between `~/foo` and `/home/user/foo` —
-they normalise to the same string and share the same token and decline record.
-
-**Confirmed token takes priority over decline cache.** If a command was
-previously declined and then explicitly re-confirmed, the fresh confirmation
-wins. Decline is not permanent if the user actively re-approves — but the model
-cannot silently retry without triggering a new dialog.
-
-**Declined = permanently blocked until re-confirmed.** A session-scoped decline
-cache prevents the model from re-prompting the user for the same command string
-without going back through the confirmation dialog. The model is explicitly told
-not to retry or find alternatives.
-
-### Layer 6 — Sudo gate
-
-All `sudo` commands (including confirmed destructive ones) require a fresh
-password approval via MCP elicitation, zenity, kdialog, or pkexec. By default
-nothing is cached: every sudo call prompts, and `sudo -k` wipes sudo's own
-timestamp after each one.
-
-**Optional session cache (off by default).** Set
-`LAMSYSTEMS_COMMANDER_SUDO_CACHE=session` in the server's `env` block and a
-password entered once is held in server memory and reused for later
-**non-destructive** sudo commands, so a read-only scan (`smartctl`, `dmesg`,
-`journalctl` …) prompts once instead of every call. Rules:
-
-- Destructive commands never read or fill the cache — they always prompt fresh,
-  after the `lc_confirm_destructive` token.
-- The cache idles out after `LAMSYSTEMS_COMMANDER_SUDO_CACHE_TTL` seconds
-  (default 900), sliding on each use, and is wiped when the server exits.
-- It only applies to the password methods (elicit, zenity, kdialog). Under
-  pkexec polkit holds the credential and the server never sees a password.
-- A cached password sudo rejects is dropped immediately and you are prompted.
-- `sudo -k` still runs after every cached command, so sudo's own timestamp is
-  never left primed by this server.
-
-The env var must be in the MCP client's config — MCP servers are launched
-with a clean environment, so exporting it in your shell does nothing.
-
-Safe sudo commands (`smartctl`, `fdisk`, `dnf`, etc.) bypass the dialog and run
-via `sudo -n` using cached credentials — no repeated password prompts for routine
-diagnostics.
-
-Because the pre-filter splits compound commands into atomic blocks (Layer 1)
-and execution iterates them one at a time, each block requiring sudo gets its
-own fresh approval.
-
----
-
-## Strict allowlist mode
-
-The pre-filter (Layer 1) holds a hard-coded `WHITELIST` of permitted binaries.
-Anything not on the list is rejected before reaching the shell. The default
-list is curated for an AI-orchestration and model-tuning workflow.
-
-**On the list (summarised; the exact set is generated into the `lc_exec_command` tool description):**
-
-- **Filesystem read:** `ls`, `cat`, `head`, `tail`, `find`, `stat`, `file`,
-  `wc`, `grep`, `tree`, `realpath`, `readlink`, `basename`, `dirname`, `pwd`
-- **File create / move / link / delete:** `cp`, `mv`, `mkdir`, `touch`, `ln`, `rm`
-  — every `rm`, including plain `rm file.txt`, hits the destructive wall
-- **Permissions:** `chmod`, `chown`, `chgrp`
-- **Text processing:** `sed`, `awk`, `cut`, `sort`, `uniq`, `tr`, `diff`,
-  `patch`, `tee`, `cmp`, `comm`, `rev`, `tac`, `paste`, `column`, `nl`
-- **Encoding / hashing:** `base64`, `sha256sum`, `sha1sum`, `md5sum`,
-  `sha512sum`, `xxd`
-- **Archives:** `tar`, `gzip`, `gunzip`, `zip`, `unzip`, `xz`, `unxz`,
-  `bzip2`, `bunzip2`, `zstd`
-- **System info:** `ps`, `uname`, `hostname`, `whoami`, `id`, `groups`,
-  `uptime`, `free`, `df`, `du`, `lsblk`, `lspci`, `lsusb`, `lscpu`, `lsof`,
-  `lsmod`, `dmesg`, `vmstat`, `iostat`
-- **Network read-only:** `ip`, `ss`, `ping`, `host`, `dig`, `nslookup`,
-  `tracepath`, `traceroute`, `mtr`, `arp`
-- **Process control:** `kill`, `killall`, `pkill`, `pgrep`, `nice`, `renice`,
-  `nohup`, `time`, `timeout`, `watch`
-- **Package info (write subcommands blocked):** `dnf`, `rpm`, `pip`, `pip3`, `uv`
-- **Project tooling via `uv run`:** `pytest`, `rail`
-- **Dev tools:** `git`, `make`, `cmake`, `ninja`, `gcc`, `g++`, `clang`, `clang++`,
-  `ld`, `ar`, `nm`, `objdump`, `ldd`, `pkg-config`
-- **Rust toolchain:** `cargo`, `rustc` — `build` / `check` / `test` / `run` /
-  `clippy` / `fmt` / `doc` / `clean` / `tree` / `metadata` allowed;
-  `install` / `uninstall` / `publish` / `login` / `logout` / `owner` / `yank` /
-  `add` / `remove` blocked
-- **GitHub CLI:** `gh` — full access (trusted dev tool on the Claude-only build)
-- **Language runtimes (`-c` / `-e` blocked):** `python`, `python3`, `node`
-- **JS package managers (install / exec / dlx blocked; `run` / `test` allowed):**
-  `npm`, `yarn`, `pnpm`
-- **Misc:** `which`, `whereis`, `type`, `echo`, `printf`, `date`, `sleep`,
-  `env`, `true`, `false`, `yes`, `seq`, `man`, `less`, `more`
-
-**Deliberately excluded:**
-
-| Binary | Why excluded |
-|---|---|
-| `dd`, `mkfs.*`, `shred`, `wipefs` | Destructive — irreversible data loss |
-| `ssh`, `scp`, `sftp`, `rsync` | Layer 3 SSH gate — exfil / C2 vectors |
-| `nc`, `netcat`, `ncat`, `socat`, `curl`, `wget` | Layer 3 network exfil gate |
-| `sh`, `perl`, `ruby` | Their `-c` / `-e` flags would bypass the whitelist entirely |
-
-`DANGEROUS_FLAGS` entries for `bash`, `sh`, `perl`, and `ruby` exist as
-defence-in-depth — if those binaries are ever added to WHITELIST in future,
-the `-c` / `-e` block is already in place.
-
-**`bash` is on the WHITELIST but approval-gated (`SCRIPT_RUNNERS`).** The only
-admissible form is `bash /absolute/path/script.sh [args]`. `bash -c` and every
-other bash flag, bare `bash` (so `cat x | bash` too), relative script paths,
-and scripts under `/tmp`, `/var/tmp`, `/dev/shm` or `~/.commander_workspace`
-are rejected at the pre-filter. Every admissible run is flagged by
-`command_is_destructive`, so it needs a one-time `lc_confirm_destructive`
-token: the dialog shows the script path and a content hash, and the token is
-bound to that content — if the script file changes between approval and
-execution the token is void and the user is asked again. The hash covers the
-script file itself, not files it sources or calls. Declining blocks that exact
-command for the rest of the session. To hard-ban shell scripts again, delete
-`SCRIPT_RUNNERS` and the `| SCRIPT_RUNNERS` on the WHITELIST line in `shell.py`.
-
-**`find` is on the WHITELIST but gated:** `-delete`, `-exec`, and `-execdir`
-are blocked via `DANGEROUS_FLAGS`. Normal use (`find /path -name '*.log'`) works;
-mass deletion and arbitrary command execution via find do not.
-
-**`uv` is on the WHITELIST but `uv run` is treated as a wrapper.** `uv run
-[flags] <cmd>` is unwrapped and `<cmd>` is vetted exactly as if typed bare —
-so `uv run pytest -q` passes, while `uv run bash -c …`, `uv run curl …` and
-`uv run python -c …` are rejected the same way the bare forms are, and
-`uv run rm -rf …` hits the destructive wall. `uv run -m mod` is vetted as
-`python3 -m mod`. Environment-mutating subcommands (`add`, `remove`, `sync`,
-`pip install`, `tool …`, `self …`, `cache clean`) and code-injecting run flags
-(`--with`, `--with-requirements`, `--with-editable`, `--script`) are blocked.
-Note that `uv run` will still auto-sync the project environment on first use
-if the lockfile and `.venv` disagree; run `uv sync` yourself if you want that
-to be a deliberate step.
-
-### Extending the allowlist
-
-If you trust your own setup and want to add binaries (or remove some), edit
-`WHITELIST` and `DANGEROUS_FLAGS` at the top of the pre-filter section in
-`src/lamsystems_commander/shell.py`. After editing, re-run the verification
-step in the [Verification](#verification) section and the test harness at
-`test_prefilter.py` to confirm nothing regressed.
+`shell.WHITELIST`, `DISK_TOOLS`, `DANGEROUS_FLAGS`,
+`command_requires_ssh_gate()` and `command_has_network_exfil()` are still in
+the source, still importable, and **not consulted**. They are kept so the
+local-model fork can pull fixes from here and so the gating history stays
+readable.
 
 ---
 
@@ -656,7 +448,7 @@ lamsystems-commander/
     ├── __init__.py
     ├── __main__.py               # entry point
     ├── server.py                 # FastMCP tool registry + tool call logger + lc_confirm_destructive
-    ├── shell.py                  # pre-filter pipeline + WHITELIST + DANGEROUS_FLAGS + sudo gate + destructive wall + scratchpad
+    ├── shell.py                  # pre-filter + sudo gate + destructive wall + scratchpad (WHITELIST/DANGEROUS_FLAGS retained, not enforced)
     ├── prompt.py                 # elicit / zenity / kdialog / pkexec + sudo passthrough
     ├── files.py                  # read/write/edit/list/move/mkdir/stat + _file_guard()
     ├── processes.py              # ps, kill, managed sessions + command_gate()
@@ -680,8 +472,8 @@ python3 -m py_compile src/lamsystems_commander/*.py
 python3 check_import.py     # expects: 25 tools loaded: lc_confirm_destructive, ...
 ```
 
-Run the pre-filter test harness after any change to `WHITELIST`, `DANGEROUS_FLAGS`,
-or the pre-filter pipeline itself:
+Run the pre-filter test harness after any change to the pre-filter, the
+destructive wall, or block splitting:
 
 ```bash
 python3 test_prefilter.py

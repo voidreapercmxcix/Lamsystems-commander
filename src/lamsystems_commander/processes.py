@@ -17,8 +17,6 @@ from typing import Optional
 
 from lamsystems_commander.shell import (
     pre_filter,
-    command_requires_ssh_gate,
-    command_has_network_exfil,
     command_targets_server_source,
     command_is_destructive,
     consume_confirmed_command,
@@ -74,43 +72,23 @@ async def _drain(stream: asyncio.StreamReader, buf: list[bytes]) -> None:
 # vetted token list to pass directly to create_subprocess_exec.
 # Returns (error_string, None) on any failure.
 
-def command_gate(command: str) -> tuple[str | None, list[str] | None]:
-    """Vet a command string through the full safety gate stack.
+def command_gate(command: str) -> tuple[str | None, str | None]:
+    """Vet a command string for a background session. Claude-only build:
+    pre-filter (quoting, no command substitution, script-run shape), server
+    source protection, and the destructive wall. Compound commands are fine —
+    the session runs the string through a shell.
 
-    Returns (None, tokens) on pass, (error_message, None) on any failure.
-    Callers must check the first element before launching any subprocess.
+    Returns (None, command) on pass, (error_message, None) on any failure.
     """
-    # Gate 1: pre-filter pipeline
     pf = pre_filter(command)
     if pf.failed:
         return f"Pre-filter rejected: {pf.reason}", None
 
-    # process sessions only support a single atomic command — no && / || / ;
-    if len(pf.atomic_commands) != 1:
-        return (
-            "start_process only accepts a single command. "
-            "Compound commands (&&, ||, ;) are not allowed in process sessions. "
-            "Use lc_exec_command for compound one-shot commands instead.",
-            None,
-        )
-
-    # Gate 2: SSH gate
-    if command_requires_ssh_gate(command):
-        return "Blocked: SSH/SCP/SFTP/rsync are not permitted (network gate)", None
-
-    # Gate 3: network exfil gate
-    if command_has_network_exfil(command):
-        return "Blocked: nc/curl/wget/socat are not permitted (network exfil gate)", None
-
-    # Gate 4: file integrity protection
     if command_targets_server_source(command):
         return "Blocked: commands targeting the server source directory are not permitted", None
 
-    # Gate 5: destructive hard wall — same rule as execute_command.
-    # Without this, lc_start_process was a way to run `mkfs.ext4 /dev/sdb1`
-    # with no confirmation dialog at all, while lc_exec_command required one
-    # for the identical string. A gate that one tool enforces and another
-    # ignores is not a gate.
+    # Destructive hard wall — same rule as execute_command. A gate that one
+    # tool enforces and another ignores is not a gate.
     if command_is_destructive(command):
         if is_session_declined(command):
             return (
@@ -127,7 +105,7 @@ def command_gate(command: str) -> tuple[str | None, list[str] | None]:
                 None,
             )
 
-    return None, pf.atomic_commands[0]
+    return None, os.path.expanduser(command)
 
 
 # ---------------------------------------------------------------------------
@@ -188,21 +166,20 @@ def kill_process(pid: int, signal_name: str = "TERM") -> str:
 async def start_process(command: str, cwd: Optional[str] = None) -> str:
     """Start a long-running process and return its session_id.
 
-    The command is vetted through the full safety gate stack (pre-filter pipeline,
-    SSH gate, network exfil gate, file integrity protection) before any subprocess
-    is created. Compound commands (&&, ||, ;) are not allowed — one atomic command
-    per session.
+    The command is vetted (pre-filter, server-source protection, destructive
+    wall) before any subprocess is created, then run through a shell so
+    pipes, redirects and compound commands (&&, ||, ;) all work.
 
     Use read_process_output to poll its stdout/stderr and interact_with_process
     to send input on stdin.
     """
     # Gate: full safety check before any subprocess is created
-    gate_error, tokens = command_gate(command)
+    gate_error, vetted = command_gate(command)
     if gate_error:
         return json.dumps({"error": gate_error}, indent=2)
 
-    proc = await asyncio.create_subprocess_exec(
-        *tokens,
+    proc = await asyncio.create_subprocess_shell(
+        vetted,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,

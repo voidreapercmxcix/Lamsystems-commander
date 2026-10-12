@@ -274,8 +274,8 @@ def _segment_binary(segment: list[str]) -> tuple[Optional[str], list[str]]:
 
     Known limit: a non-numeric wrapper value (`timeout 30s cmd`) resolves to
     that value rather than the binary. Harmless here — this function only
-    decides whether confirmation is required, and _vet_atomic runs the same
-    unwrapping to decide admissibility.
+    decides whether confirmation is required, and _vet_block runs the same
+    unwrapping for the script-runner shape check.
     """
     i = 0
     while i < len(segment):
@@ -311,9 +311,11 @@ def _segment_binary(segment: list[str]) -> tuple[Optional[str], list[str]]:
 #   - `bash -c ...` and EVERY other bash flag (-s, -i, --rcfile, ...)
 #   - bare `bash` (interactive / reads stdin, so `cat x | bash` is dead too)
 #   - relative script paths (the dialog must show exactly which file runs)
-#   - scripts under /tmp, /var/tmp, /dev/shm or the scratchpad
-#   - sh / perl / ruby — not on the whitelist at all
-SCRIPT_RUNNERS: frozenset[str] = frozenset({"bash"})
+#   - sh / zsh / dash / ksh are in the same set so `sh -c` is not a side door
+#
+# Claude-only build: scripts may live anywhere (including /tmp) — the approval
+# dialog shows the exact path and the token is bound to the file's content.
+SCRIPT_RUNNERS: frozenset[str] = frozenset({"bash", "sh", "zsh", "dash", "ksh"})
 
 
 def script_run_targets(command: str) -> list[str]:
@@ -372,20 +374,21 @@ def _script_run_blocked(args: list[str]) -> str | None:
             f"so the approval dialog shows exactly which file will run."
         )
     try:
-        resolved = pathlib.Path(script).resolve()
+        pathlib.Path(script).resolve()
     except Exception:
         return f"Script path could not be resolved: {script!r}"
-    for restricted in _RESTRICTED_SCRIPT_DIRS:
-        try:
-            resolved.relative_to(restricted.resolve())
-        except ValueError:
-            continue
-        return (
-            f"BLOCKED: executing a script from '{restricted}' is not permitted. "
-            f"Shell scripts in writable or temporary directories cannot be run, "
-            f"with or without approval."
-        )
     return None
+
+
+# Subcommands that make an otherwise read-only diagnostic binary irreversible.
+# These used to be banned outright via DANGEROUS_FLAGS; on the Claude-only
+# build they are allowed but routed through the confirmation dialog instead.
+_DESTRUCTIVE_SUBCOMMANDS: dict[str, frozenset[str]] = {
+    "nvme": frozenset({
+        "format", "sanitize", "format-nvm", "write", "write-zeroes",
+        "delete-ns", "create-ns", "fw-commit", "fw-download",
+    }),
+}
 
 
 def command_is_destructive(command: str, include_script_runs: bool = True) -> bool:
@@ -417,6 +420,12 @@ def command_is_destructive(command: str, include_script_runs: bool = True) -> bo
         binary, args = _segment_binary(segment)
         if binary is None:
             continue
+
+        # Destructive subcommands of diagnostic binaries — checked BEFORE the
+        # safe-binary skip, since nvme is in _SAFE_BINARIES for its read forms.
+        sub = _DESTRUCTIVE_SUBCOMMANDS.get(binary)
+        if sub and any(arg in sub for arg in args):
+            return True
 
         # Safe binaries clear THIS segment only — they must not short-circuit
         # the whole scan. "cat foo | dd of=/dev/nvme0n1" and "ls; rm -rf /"
@@ -462,7 +471,9 @@ _SUDO_BINARIES = {"sudo", "/usr/bin/sudo", "/bin/sudo"}
 
 
 # ---------------------------------------------------------------------------
-# SSH / remote shell gate — full stop blocker
+# SSH / remote shell gate and network exfil gate — RETAINED, NOT ENFORCED on
+# the Claude-only build (ssh, scp, rsync, curl, wget all run). Kept importable
+# for the local-model fork.
 # ---------------------------------------------------------------------------
 _SSH_BINARIES = {"ssh", "scp", "sftp", "rsync"}
 
@@ -558,116 +569,57 @@ def command_requires_sudo(command: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Pre-filter pipeline — the single chokepoint
+# Pre-filter — Claude-only build
 # ---------------------------------------------------------------------------
-# Every command that enters execute_command passes here FIRST, before file
-# integrity, SSH gate, network exfil, destructive wall, sudo, or subprocess.
+# This build treats the model as a trusted operator. The pre-filter no longer
+# enforces a binary allowlist, dangerous-flag bans, injection-character or
+# path-traversal checks, redirect bans, or the SSH / network-exfil gates. The
+# shell runs the command as written.
 #
-# Stages:
-#   Pass 1 — raw string scan for things shlex won't isolate cleanly: $( ... ), `...`.
-#   Pass 2 — structural tokenisation via shlex.split.
-#   Pass 3 — hard-ban redirect operators ( > >> < ). The pipe `|` is allowed
-#     and vetted per-stage in Pass 5 (a pipeline of vetted read-only binaries).
-#   Pass 4 — split on sequence operators (&& || ;) into atomic blocks.
-#   Pass 5 — vet each atomic block: whitelist + injection chars + path traversal
-#            + per-binary dangerous flags.
-#
-# Correctness invariants — DO NOT regress on these:
-#   - "'../' in '..'" is False. Path traversal MUST use component-level check
-#     ('..' in arg.split('/')). Substring matching is bypassable.
-#   - '>>' becomes two '>' tokens after shlex.split — the '>' check catches it.
-#     Both are listed in _HARD_BAN_TOKENS for readability; don't optimise either out.
-#   - '$()' and backticks won't tokenise cleanly via shlex. Pass 1 catches them
-#     in the raw string before tokenisation.
-#   - shlex.split strips outer quotes. Args that legitimately contain '&' (e.g.
-#     URL query strings) will fail the injection check. Intentional: network
-#     binaries are off the whitelist anyway.
+# What it still does, and why:
+#   Pass 0 — tilde expansion, so the confirm-token string and the executed
+#            string are always identical.
+#   Pass 1 — `$(...)` and backticks are still rejected. Not because the model
+#            is hostile, but because the destructive wall cannot see inside a
+#            substitution: `echo $(rm -rf x)` would run rm with no dialog. The
+#            wall is a gate the user asked to keep intact, so its blind spot
+#            stays closed. Write the inner command on its own line instead.
+#   Pass 2 — quote sanity (shlex must be able to tokenise it).
+#   Pass 3 — quote-aware split on && || ; into raw blocks, so sudo and the
+#            destructive wall apply per block exactly as before.
+#   Pass 4 — the shell-script approval gate shape check (SCRIPT_RUNNERS):
+#            `bash /abs/path.sh [args]` only, never `bash -c`, never bare
+#            `bash` reading stdin. This is part of the confirmation wall, not
+#            the allowlist, so it stays.
 
 # Sequences blocked at the raw-string layer (before shlex sees them).
 _RAW_BANNED = ("$(", "`")
 
-# Structural operators that hard-fail the whole command if present anywhere.
-# Redirects only: they write files / read block devices, and there is no
-# per-segment vetting that makes them safe. The PIPE is NOT here — a pipeline
-# is a chain of vetted read-only stages (see `_PIPE` handling in _vet_atomic),
-# exactly as safe as the same binaries joined with `&&`.
-_HARD_BAN_TOKENS = frozenset({">", ">>", "<"})
-
-# Sequence operators — these split the command into atomic blocks for vetting.
+# Sequence operators — these split the command into blocks for per-block
+# sudo and the stop-on-failure / run-on-failure semantics of && and ||.
 _SEQUENCE_OPERATORS = frozenset({"&&", "||", ";"})
 
-# Pipe operator. Kept inside an atomic block (so the pipeline runs in ONE shell
-# invocation and data actually flows), but each stage is vetted separately.
-_PIPE = "|"
+# Operators that end a command segment for the script-runner shape check.
+_SEGMENT_BREAKERS = _SHELL_OPERATORS | {">", ">>", "<", "2>", "&>"}
 
-# Characters that must not appear inside any argument after shlex tokenisation.
-_INJECTION_CHARS = frozenset(";&|$()`")
-
-# ---------------------------------------------------------------------------
-# Interpreter script-path gate
-# ---------------------------------------------------------------------------
-# Blocks execution of scripts dropped into user-writable / temp directories.
-# This closes the lc_write_file → python3 /tmp/payload.py exploit path.
-#
-# A model can still run `python3` interactively (via lc_start_process) or
-# execute scripts from trusted locations (the project tree, system site-packages
-# etc). It cannot point an interpreter at a file it just wrote to /tmp or the
-# scratchpad.
-
+# Retained for the local-model fork; not consulted on this build.
 _SCRIPT_INTERPRETERS: frozenset[str] = frozenset({"python", "python3", "node"})
-
 _RESTRICTED_SCRIPT_DIRS: tuple[pathlib.Path, ...] = (
     pathlib.Path("/tmp"),
     pathlib.Path("/var/tmp"),
     pathlib.Path("/dev/shm"),
-    pathlib.Path.home() / ".commander_workspace",   # scratchpad / tool log
+    pathlib.Path.home() / ".commander_workspace",
 )
 
-_SCRIPT_EXTENSIONS: frozenset[str] = frozenset({".py", ".js", ".mjs", ".cjs"})
-
-
-def _script_path_blocked(tokens: list[str]) -> str | None:
-    """Return an error string if tokens represent an interpreter running a
-    script from a user-writable or temp directory. Returns None on pass.
-
-    Only fires when the binary is a known interpreter AND an argument looks
-    like a file path (contains '/' or ends with a known script extension).
-    Pure REPL invocations (e.g. `python3` with no args) are unaffected.
-    """
-    if not tokens:
-        return None
-    binary = tokens[0].split("/")[-1]
-    if binary not in _SCRIPT_INTERPRETERS:
-        return None
-
-    for arg in tokens[1:]:
-        # Skip flags
-        if arg.startswith("-"):
-            continue
-        # Only check things that look like file paths
-        is_path_like = "/" in arg or any(arg.endswith(ext) for ext in _SCRIPT_EXTENSIONS)
-        if not is_path_like:
-            continue
-        try:
-            resolved = pathlib.Path(arg).resolve()
-        except Exception:
-            return f"Script path could not be resolved: {arg!r}"
-        for restricted in _RESTRICTED_SCRIPT_DIRS:
-            try:
-                resolved.relative_to(restricted.resolve())
-                return (
-                    f"BLOCKED: executing a script from '{restricted}' is not permitted. "
-                    f"Models may not run scripts they have dropped into writable or "
-                    f"temporary directories. Move the script to a project directory "
-                    f"or use an absolute path outside restricted locations."
-                )
-            except ValueError:
-                pass
-    return None
-
-
-# Strict allowlist. Anything not listed is rejected at the pre-filter.
-# Curated for an AI-orchestration / model-tuning workflow.
+# ---------------------------------------------------------------------------
+# CLAUDE-ONLY BUILD: WHITELIST, DISK_TOOLS and DANGEROUS_FLAGS below are
+# RETAINED BUT NOT ENFORCED. They stay importable so the local-model fork
+# (Lmstudio-commander) can keep pulling fixes, and so the history of what was
+# gated is readable. On this build the only runtime gates are the destructive
+# wall (lc_confirm_destructive) and sudo.
+# ---------------------------------------------------------------------------
+# Strict allowlist. (Historical: anything not listed was rejected at the
+# pre-filter.) Curated for an AI-orchestration / model-tuning workflow.
 #
 # Deliberate exclusions (do not add without thinking hard about why):
 #   ssh / scp / sftp / rsync          — also blocked by command_requires_ssh_gate
@@ -868,13 +820,18 @@ DANGEROUS_FLAGS: dict[str, frozenset[str]] = {
 
 @dataclass
 class FilterResult:
-    """Outcome of the pre-filter pipeline.
+    """Outcome of the pre-filter.
 
-    On pass: passed=True, atomic_commands carries the token-list per atomic block.
-    On fail: passed=False, reason carries the rejection message (used in stderr).
+    On pass: passed=True, raw_blocks carries each && / || / ; separated block
+    verbatim (quote-aware split), operators[i] is the operator that preceded
+    raw_blocks[i] ("" for the first). atomic_commands is a best-effort
+    tokenisation of each block, kept for callers/tests that inspect tokens.
+    On fail: passed=False, reason carries the rejection message.
     """
     passed: bool
     reason: str = ""
+    raw_blocks: list[str] = field(default_factory=list)
+    operators: list[str] = field(default_factory=list)
     atomic_commands: list[list[str]] = field(default_factory=list)
 
     @property
@@ -882,205 +839,112 @@ class FilterResult:
         return not self.passed
 
 
-def _pf_pass(atomic_commands: list[list[str]]) -> FilterResult:
-    return FilterResult(passed=True, atomic_commands=atomic_commands)
-
-
 def _pf_fail(reason: str) -> FilterResult:
     return FilterResult(passed=False, reason=reason)
 
 
-def pre_filter(raw_input: str) -> FilterResult:
-    """Vet a raw command string. Returns FilterResult.
+def _split_raw_blocks(raw: str) -> tuple[list[str], list[str]]:
+    """Quote- and escape-aware split of a command string on && || ;.
 
-    On pass, FilterResult.atomic_commands contains one token-list per atomic
-    block (split on &&, ||, ;). The executor iterates these one at a time so
-    sudo and execution happen per-block.
+    Returns (blocks, operators) where operators[i] preceded blocks[i]. A
+    single `&` (background / `2>&1`) and `|` are NOT splitters — they stay
+    inside the block so the shell sees them. `\\;` (find -exec) is an escape
+    and is not a splitter either.
     """
-    # Pass 0: tilde expansion — normalise ~ to the real home directory before
-    # any further processing. This ensures the token issued by
-    # lc_confirm_destructive and the path passed to lc_exec_command are always
-    # the same string, preventing the double-confirmation bug where
-    # `rm -r ~/foo` and `rm -r /home/user/foo` produce different tokens.
+    blocks: list[str] = []
+    ops: list[str] = []
+    cur: list[str] = []
+    in_single = in_double = False
+    i, n = 0, len(raw)
+    pending_op = ""
+    while i < n:
+        c = raw[i]
+        if c == "\\" and not in_single and i + 1 < n:
+            cur.append(c); cur.append(raw[i + 1]); i += 2; continue
+        if c == "'" and not in_double:
+            in_single = not in_single; cur.append(c); i += 1; continue
+        if c == '"' and not in_single:
+            in_double = not in_double; cur.append(c); i += 1; continue
+        if not in_single and not in_double:
+            two = raw[i:i + 2]
+            if two in ("&&", "||"):
+                blocks.append("".join(cur)); ops.append(pending_op)
+                cur = []; pending_op = two; i += 2; continue
+            if c == ";":
+                blocks.append("".join(cur)); ops.append(pending_op)
+                cur = []; pending_op = ";"; i += 1; continue
+        cur.append(c); i += 1
+    blocks.append("".join(cur)); ops.append(pending_op)
+    out_blocks, out_ops = [], []
+    for b, o in zip(blocks, ops):
+        if b.strip():
+            out_blocks.append(b.strip()); out_ops.append(o)
+    return out_blocks, out_ops
+
+
+def _vet_block(block: str) -> str | None:
+    """Shell-script approval-gate shape check for one raw block. Returns an
+    error string or None. Everything else in the block is allowed."""
+    tokens = _lex(block)
+    segments: list[list[str]] = []
+    cur: list[str] = []
+    for tok in tokens:
+        if tok in _SEGMENT_BREAKERS:
+            if cur:
+                segments.append(cur); cur = []
+        else:
+            cur.append(tok)
+    if cur:
+        segments.append(cur)
+    for seg in segments:
+        binary, args = _segment_binary(seg)
+        if binary in SCRIPT_RUNNERS:
+            err = _script_run_blocked(args)
+            if err:
+                return err
+    return None
+
+
+def pre_filter(raw_input: str) -> FilterResult:
+    """Vet a raw command string. Returns FilterResult (see class docstring)."""
+    # Pass 0: tilde expansion — keeps confirm tokens and executed strings equal.
     raw_input = os.path.expanduser(raw_input)
 
-    # Pass 1: raw-string scan for subshell / command substitution.
+    # Pass 1: command substitution — the destructive wall cannot see inside it.
     for pattern in _RAW_BANNED:
         if pattern in raw_input:
             return _pf_fail(
-                f"Subshell or command substitution detected ({pattern})"
+                f"Command substitution ({pattern}) is not permitted: the "
+                f"destructive-command wall cannot inspect what runs inside it. "
+                f"Run the inner command as its own step instead."
             )
 
-    # Pass 2: structural tokenisation.
+    # Pass 2: quote sanity.
     try:
         tokens = shlex.split(raw_input)
     except ValueError as e:
         return _pf_fail(f"Malformed shell quoting: {e}")
-
     if not tokens:
         return _pf_fail("Empty command string")
 
-    # Pass 3: hard-ban redirect operators outright (any position).
-    for token in tokens:
-        if token in _HARD_BAN_TOKENS:
-            return _pf_fail(f"Forbidden structural operator: {token}")
-
-    # Pass 4: split on sequence operators into atomic blocks.
-    atomic_blocks: list[list[str]] = []
-    current_block: list[str] = []
-    for token in tokens:
-        if token in _SEQUENCE_OPERATORS:
-            if current_block:
-                atomic_blocks.append(current_block)
-                current_block = []
-        else:
-            current_block.append(token)
-    if current_block:
-        atomic_blocks.append(current_block)
-
-    if not atomic_blocks:
+    # Pass 3: split into raw blocks.
+    blocks, ops = _split_raw_blocks(raw_input)
+    if not blocks:
         return _pf_fail("No executable commands found")
 
-    # Pass 5: vet each atomic block independently. Any block failing rejects
-    # the whole compound — never partial admit.
-    for block in atomic_blocks:
-        result = _vet_atomic(block)
-        if result.failed:
-            return result
-
-    return _pf_pass(atomic_blocks)
-
-
-def _real_binary_index(tokens: list[str], unwrap_uv: bool = True) -> int:
-    """Index of the first token that is a real binary, skipping wrappers.
-
-    Wrappers (sudo, env, nice, timeout, ...) prefix the command that actually
-    runs. Two things went wrong before this existed:
-
-      1. `sudo` is not on the WHITELIST, so EVERY sudo command was rejected at
-         the whitelist check and the entire sudo approval chain in prompt.py
-         became unreachable dead code.
-      2. Wrappers that ARE whitelisted hid the real binary from vetting:
-         `timeout 30 <anything>` passed, because the check only ever looked at
-         tokens[0]. That was a straight whitelist bypass.
-
-    Matching is on the exact token, never the basename — `/tmp/evil/ls` must
-    not be admitted just because it ends in a whitelisted name.
-
-    Returns -1 if the block is nothing but wrappers.
-    """
-    i = 0
-    while i < len(tokens):
-        if tokens[i] in _COMMAND_WRAPPERS:
-            i += 1
-            # Skip the wrapper's own flags / KEY=value / numeric arguments,
-            # e.g. `nice -n 5 cmd`, `timeout 30 cmd`, `env FOO=bar cmd`.
-            while i < len(tokens) and (
-                tokens[i].startswith("-") or "=" in tokens[i] or tokens[i].isdigit()
-            ):
-                i += 1
-            continue
-        if unwrap_uv and tokens[i] == "uv":
-            j, _err = _unwrap_uv_run(tokens, i)
-            if j > i and tokens[j] != "-m":
-                i = j
-                continue
-        return i
-    return -1
-
-
-def _vet_atomic(tokens: list[str]) -> FilterResult:
-    """Vet one atomic block, which may be a pipeline (stage | stage | ...).
-
-    A pipeline is split on `|` and every stage is vetted as its own command;
-    the pipe merely connects vetted read-only stages, so `ps aux | head` is
-    exactly as admissible as `ps aux && head`. A block with no pipe is a single
-    command and goes straight through. `|` never reaches `_vet_command`, so the
-    injection-char guard there still rejects a stray/glued `|` inside an arg."""
-    if _PIPE not in tokens:
-        return _vet_command(tokens)
-    stage: list[str] = []
-    for tok in tokens:
-        if tok == _PIPE:
-            result = _vet_command(stage)
-            if result.failed:
-                return result
-            stage = []
-        else:
-            stage.append(tok)
-    return _vet_command(stage)  # final stage (empty → "Empty atomic block")
-
-
-def _vet_command(tokens: list[str]) -> FilterResult:
-    """Apply whitelist + injection + traversal + per-binary flag checks to a
-    single command (one pipeline stage, no `|`)."""
-    if not tokens:
-        return _pf_fail("Empty atomic block")
-
-    # `uv run` flags are checked on the ORIGINAL tokens: once unwrapped, the
-    # binary under vetting is the target command and DANGEROUS_FLAGS["uv"]
-    # would never see them.
-    k = _real_binary_index(tokens, unwrap_uv=False)
-    if k >= 0 and tokens[k] == "uv":
-        j, err = _unwrap_uv_run(tokens, k)
+    # Pass 4: shell-script approval-gate shape check, per block.
+    atomic: list[list[str]] = []
+    for block in blocks:
+        err = _vet_block(block)
         if err:
             return _pf_fail(err)
-        if j > k and tokens[j] == "-m":
-            # `uv run -m mod args` ≡ `python3 -m mod args`
-            return _vet_command(["python3", *tokens[j:]])
+        try:
+            atomic.append(shlex.split(block))
+        except ValueError:
+            atomic.append(block.split())
 
-    idx = _real_binary_index(tokens)
-    if idx < 0:
-        return _pf_fail(
-            f"No binary found after command wrapper(s): {' '.join(tokens)!r}"
-        )
-    binary, *args = tokens[idx:]
-
-    # Strict allowlist — exact match on the binary name.
-    if binary not in WHITELIST:
-        return _pf_fail(
-            f"Binary not on whitelist: {binary} "
-            f"(strict allowlist is enabled — add to WHITELIST in shell.py to permit)"
-        )
-
-    # Injection chars surviving shlex (redirect chars are already hard-banned
-    # upstream). shlex strips outer quotes, so an arg legitimately containing
-    # one of these (e.g. a URL query with `&`) will be rejected. Intentional:
-    # network binaries are off the whitelist regardless.
-    for arg in args:
-        if any(c in _INJECTION_CHARS for c in arg):
-            return _pf_fail(
-                f"Injection character in argument: {arg!r} "
-                f"(shell metacharacters not permitted inside arguments)"
-            )
-
-    # Path traversal — component-level. DO NOT change to substring matching.
-    for arg in args:
-        if ".." in arg.split("/"):
-            return _pf_fail(f"Path traversal detected in argument: {arg}")
-
-    # Per-binary banned flags.
-    banned = DANGEROUS_FLAGS.get(binary)
-    if banned:
-        for arg in args:
-            # Match both `--flag` and the `--flag=value` form.
-            if arg in banned or arg.split("=", 1)[0] in banned:
-                return _pf_fail(f"Dangerous flag for {binary}: {arg}")
-
-    # Shell script runner shape gate — script-file form only, absolute path,
-    # no flags, not from temp / writable directories.
-    if binary in SCRIPT_RUNNERS:
-        runner_err = _script_run_blocked(args)
-        if runner_err:
-            return _pf_fail(runner_err)
-
-    # Interpreter script-path gate — blocks execution of scripts dropped into
-    # temp / writable directories (e.g. lc_write_file → python3 /tmp/x.py).
-    script_err = _script_path_blocked(tokens[idx:])
-    if script_err:
-        return _pf_fail(script_err)
-
-    return _pf_pass([])
+    return FilterResult(passed=True, raw_blocks=blocks, operators=ops,
+                        atomic_commands=atomic)
 
 
 # ---------------------------------------------------------------------------
@@ -1164,28 +1028,6 @@ async def _run_subprocess(
     }
 
 
-def _block_to_shell_str(block: list[str]) -> str:
-    """Render a vetted atomic block for shell execution.
-
-    Each pipeline stage is shlex-quoted independently so no argument metachar
-    can escape; only the `|` that separates already-vetted stages is emitted
-    bare, so the shell runs a real pipeline in one invocation (data flows). A
-    block with no pipe is just `shlex.join(block)` as before. Redirects never
-    reach here — they are hard-banned upstream."""
-    if _PIPE not in block:
-        return shlex.join(block)
-    parts: list[str] = []
-    stage: list[str] = []
-    for tok in block:
-        if tok == _PIPE:
-            parts.append(shlex.join(stage))
-            stage = []
-        else:
-            stage.append(tok)
-    parts.append(shlex.join(stage))
-    return " | ".join(parts)
-
-
 async def execute_command(
     command: str,
     *,
@@ -1196,13 +1038,11 @@ async def execute_command(
 ) -> dict:
     """Execute a shell command via the pre-filter pipeline.
 
-    Order of checks (each stage may reject):
-        1. Pre-filter pipeline   — whitelist / operators / traversal / dangerous flags
+    Order of checks (each stage may reject) — Claude-only build:
+        1. Pre-filter            — quoting, no $(...)/backticks, script-run shape
         2. File integrity        — server source directory references
-        3. SSH gate              — ssh / scp / sftp / rsync
-        4. Network exfil gate    — nc / netcat / ncat / socat / curl / wget
-        5. Destructive wall      — lc_confirm_destructive token
-        6. Per-atomic-block sudo + execution
+        3. Destructive wall      — lc_confirm_destructive token
+        4. Per-block sudo + execution (&& / || / ; semantics honoured)
 
     Each atomic block of a compound command (split on &&, ||, ;) runs as its
     own subprocess. Sudo authenticates per block — design's "sudo fires once
@@ -1238,39 +1078,8 @@ async def execute_command(
             "sudo_method": "blocked_file_integrity",
         }
 
-    # ---- SSH / remote shell gate ----
-    if command_requires_ssh_gate(command):
-        return {
-            "exit_code": -1,
-            "stdout": "",
-            "stderr": (
-                "BLOCKED: SSH, SCP, SFTP and rsync are not permitted through this server.\n"
-                "Remote shell access and file transfer to external hosts are disabled."
-            ),
-            "timed_out": False,
-            "sudo_used": False,
-            "sudo_method": "blocked_ssh_gate",
-        }
-
-    # ---- Network exfil gate ----
-    if command_has_network_exfil(command):
-        return {
-            "exit_code": -1,
-            "stdout": "",
-            "stderr": (
-                "BLOCKED: nc, netcat, socat, curl and wget are not permitted through this server.\n"
-                "Network data transfer tools are disabled to prevent exfiltration."
-            ),
-            "timed_out": False,
-            "sudo_used": False,
-            "sudo_method": "blocked_network_exfil",
-        }
-
-    # ---- Destructive hard wall (still in place per design Decision 1=a) ----
-    # In practice the current WHITELIST excludes rm/dd/mkfs.*/shred/wipefs, so
-    # destructive binaries are rejected by the pre-filter and never reach here.
-    # The wall stays so that if a destructive binary is later added to the
-    # WHITELIST, the user still sees an explicit confirmation dialog.
+    # ---- Destructive hard wall ----
+    # One of the two gates this build keeps. Unchanged.
     is_destructive = command_is_destructive(command)
     if is_destructive:
         # Check for a confirmed token FIRST — a fresh confirmation after a
@@ -1325,8 +1134,14 @@ async def execute_command(
         "sudo_method": "none",
     }
 
-    for block in pf_result.atomic_commands:
-        block_str = _block_to_shell_str(block)
+    prev_ok = True
+    for block_str, op in zip(pf_result.raw_blocks, pf_result.operators):
+        # Honour the operator that preceded this block: && runs on success,
+        # || runs on failure, ; always runs. A timeout stops the sequence.
+        if op == "&&" and not prev_ok:
+            continue
+        if op == "||" and prev_ok:
+            continue
         block_result = await _execute_atomic_block(
             block_str, ctx=ctx, cwd=cwd, timeout=timeout, shell=shell,
             is_destructive=is_destructive,
@@ -1337,8 +1152,9 @@ async def execute_command(
             any_sudo_used = True
         sudo_methods.append(block_result.get("sudo_method", "none"))
         last_result = block_result
-        if block_result.get("timed_out") or block_result.get("exit_code", 0) != 0:
+        if block_result.get("timed_out"):
             break
+        prev_ok = block_result.get("exit_code", 0) == 0
 
     # Collapse sudo_method when every block reported the same; otherwise join.
     if len(set(sudo_methods)) == 1:

