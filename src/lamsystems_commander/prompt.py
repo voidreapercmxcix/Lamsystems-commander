@@ -4,6 +4,8 @@ Resolution order (auto mode):
     1. MCP elicitation — preferred; client (e.g. LM Studio, Claude Desktop) shows an in-app form
     2. zenity         — GNOME-style native password dialog
     3. kdialog        — KDE-style native password dialog
+       (on KDE Plasma, kdialog is tried before zenity: one dialog with the
+       command and the password field together, and KWin can keep it above)
     4. pkexec         — polkit-handled root elevation (no password through us)
     5. refused        — clear error to the LLM
 
@@ -24,6 +26,8 @@ Why these in particular:
 from __future__ import annotations
 
 import asyncio
+import html
+import logging
 import os
 import shlex
 import shutil
@@ -33,6 +37,55 @@ from dataclasses import dataclass
 from typing import Optional
 
 from pydantic import BaseModel, Field
+
+# Same logger server.py writes to (~/.commander_workspace/tool_calls.log), so
+# dialog failures land next to the tool call that triggered them.
+_log = logging.getLogger("lamsystems_commander.tools")
+
+
+def _kde_session() -> bool:
+    """True when the user's desktop is KDE Plasma. MCP clients launch us with a
+    clean env, so XDG_CURRENT_DESKTOP is usually unset here; fall back to
+    probing for a running kwin."""
+    if "kde" in os.environ.get("XDG_CURRENT_DESKTOP", "").lower():
+        return True
+    try:
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            try:
+                with open(f"/proc/{pid}/comm") as f:
+                    if f.read().strip().startswith("kwin"):
+                        return True
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return False
+
+
+def _kdialog_text(text: str) -> str:
+    """kdialog renders its message as rich text, so a bare & < > in a command
+    is swallowed as markup. Escape so the command shows verbatim."""
+    return html.escape(text, quote=False)
+
+
+def _log_dialog_stderr(method: str, returncode, stderr: bytes | None, command: str) -> None:
+    """Surface dialog stderr instead of swallowing it. A markup parse failure
+    (zenity/kdialog silently replace the text with a generic fallback) or a
+    non-zero exit is worth a warning in the tool log."""
+    text = (stderr or b"").decode(errors="replace").strip()
+    if not text:
+        return
+    noisy = ("adwaita-warning", "radv is not a conformant")
+    lines = [l for l in text.splitlines() if l.strip() and not any(n in l.lower() for n in noisy)]
+    if not lines:
+        return
+    if returncode != 0 or "markup" in text.lower():
+        _log.warning(
+            f"{method} dialog stderr (exit {returncode}) | command={command!r} | "
+            + " / ".join(lines)[:600]
+        )
 
 # ---------------------------------------------------------------------------
 # Sudo passthrough — these binaries skip the approval dialog entirely
@@ -343,7 +396,9 @@ async def _try_gui_dialog(
         start_new_session=True,
         env=env,
     )
-    stdout, _ = await _dialog_communicate(proc, timeout=_SUDO_DIALOG_TIMEOUT_S)
+    stdout, stderr = await _dialog_communicate(proc, timeout=_SUDO_DIALOG_TIMEOUT_S)
+    if stdout is not None:
+        _log_dialog_stderr(method_label, proc.returncode, stderr, "<password dialog>")
     if stdout is None:
         # Dialog closed on timeout with no response -- report cleanly instead
         # of blocking the server forever on an unanswered prompt.
@@ -394,26 +449,32 @@ async def _try_zenity_confirm(command: str, title: str) -> Optional[bool]:
     env = gui_env()
     if env is None:
         return None
+    # --no-markup: zenity parses --text as Pango markup by default, so any
+    # command containing & < > (i.e. &&, 2>&1, redirects) fails to parse and
+    # the dialog silently shows "Are you sure you want to proceed?" with NO
+    # command. That is the worst possible failure for an approval gate.
     proc = await asyncio.create_subprocess_exec(
-        "zenity", "--question",
+        "zenity", "--question", "--no-markup",
         f"--title={title}",
         f"--text=Authorize this sudo command?\n\n{command}",
         "--ok-label=Approve", "--cancel-label=Decline",
+        "--width=600",
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         start_new_session=True,
         env=env,
     )
-    out, _ = await _dialog_communicate(proc, timeout=_SUDO_DIALOG_TIMEOUT_S)
+    out, err = await _dialog_communicate(proc, timeout=_SUDO_DIALOG_TIMEOUT_S)
     if out is None:
         return False  # timed out with no answer -- treat as a decline
+    _log_dialog_stderr("zenity-confirm", proc.returncode, err, command)
     return proc.returncode == 0
 
 
 async def _try_kdialog(command: str) -> Optional[SudoApprovalResult]:
     return await _try_gui_dialog(
         "kdialog",
-        ["--password", f"Authorize this sudo command?\n\n{command}",
+        ["--password", f"Authorize this sudo command?\n\n{_kdialog_text(command)}",
          "--title", "lamsystems-commander — sudo approval"],
         method_label="kdialog",
     )
@@ -485,17 +546,17 @@ async def request_sudo_approval(ctx, command: str, *, allow_passthrough: bool = 
         # User actively declined the elicitation — don't fall through, respect that.
         return r
 
-    r = await _try_zenity(command)
-    if r is not None and not r.declined:
-        return r
-    if r is not None and r.declined:
-        return r  # user clicked cancel — respect it
-
-    r = await _try_kdialog(command)
-    if r is not None and not r.declined:
-        return r
-    if r is not None and r.declined:
-        return r
+    # On KDE Plasma prefer kdialog: its --password dialog shows the command
+    # and the password field together (one dialog, not zenity's two), and a
+    # KWin window rule can keep it above other windows. Elsewhere keep
+    # zenity first.
+    native = (_try_kdialog, _try_zenity) if _kde_session() else (_try_zenity, _try_kdialog)
+    for strategy in native:
+        r = await strategy(command)
+        if r is not None and not r.declined:
+            return r
+        if r is not None and r.declined:
+            return r  # user clicked cancel — respect it
 
     if _can_use_pkexec():
         return SudoApprovalResult(use_pkexec=True, method="pkexec")
@@ -609,6 +670,7 @@ async def _run_confirm_dialog(binary: str, argv: list[str], *, method: str) -> C
     out, err = await _dialog_communicate(proc, timeout=_SUDO_DIALOG_TIMEOUT_S)
     if out is None:
         return ConfirmDialogResult("timeout", method, f"no answer after {_SUDO_DIALOG_TIMEOUT_S:.0f}s")
+    _log_dialog_stderr(f"{method}-destructive", proc.returncode, err, "<destructive confirm>")
     stderr = (err or b"").decode(errors="replace").strip()
     low = stderr.lower()
     if proc.returncode == 0:
@@ -627,33 +689,40 @@ async def confirm_destructive_gui(message: str) -> ConfirmDialogResult:
     """Try zenity, then kdialog. Returns the first result that is not
     "unavailable"; if both are unavailable, returns the last one so the caller
     can log why."""
-    last = ConfirmDialogResult("unavailable", "none", "no GUI dialog tool found")
-    r = await _run_confirm_dialog(
-        "zenity",
-        [
-            "--question",
-            "--title=⚠️ DESTRUCTIVE OPERATION",
-            f"--text={message}\n\nProceed?",
-            "--ok-label=CONFIRM — DESTROY",
-            "--cancel-label=Cancel",
-            "--width=500",
-        ],
-        method="zenity",
-    )
-    if r.outcome != "unavailable":
-        return r
-    last = r
-    r = await _run_confirm_dialog(
-        "kdialog",
-        [
-            "--warningyesno", f"{message}\n\nProceed?",
-            "--yes-label", "CONFIRM — DESTROY",
-            "--no-label", "Cancel",
-            "--title", "⚠️ DESTRUCTIVE OPERATION",
-        ],
-        method="kdialog",
-    )
-    if r.outcome != "unavailable":
-        return r
-    r.detail = f"zenity: {last.detail} | kdialog: {r.detail}"
-    return r
+    async def _zenity() -> ConfirmDialogResult:
+        # --no-markup for the same reason as the sudo confirm: & < > in the
+        # command must not be eaten as Pango markup.
+        return await _run_confirm_dialog(
+            "zenity",
+            [
+                "--question", "--no-markup",
+                "--title=⚠️ DESTRUCTIVE OPERATION",
+                f"--text={message}\n\nProceed?",
+                "--ok-label=CONFIRM — DESTROY",
+                "--cancel-label=Cancel",
+                "--width=600",
+            ],
+            method="zenity",
+        )
+
+    async def _kdialog() -> ConfirmDialogResult:
+        return await _run_confirm_dialog(
+            "kdialog",
+            [
+                "--warningyesno", f"{_kdialog_text(message)}\n\nProceed?",
+                "--yes-label", "CONFIRM — DESTROY",
+                "--no-label", "Cancel",
+                "--title", "⚠️ DESTRUCTIVE OPERATION",
+            ],
+            method="kdialog",
+        )
+
+    order = (_kdialog, _zenity) if _kde_session() else (_zenity, _kdialog)
+    first = await order[0]()
+    if first.outcome != "unavailable":
+        return first
+    second = await order[1]()
+    if second.outcome != "unavailable":
+        return second
+    second.detail = f"{first.method}: {first.detail} | {second.method}: {second.detail}"
+    return second
