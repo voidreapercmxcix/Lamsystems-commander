@@ -17,7 +17,10 @@ from typing import Optional
 
 from lamsystems_commander.shell import (
     pre_filter,
+    strict_mode,
     command_targets_server_source,
+    command_requires_ssh_gate,
+    command_has_network_exfil,
     command_is_destructive,
     consume_confirmed_command,
     is_session_declined,
@@ -73,10 +76,14 @@ async def _drain(stream: asyncio.StreamReader, buf: list[bytes]) -> None:
 # Returns (error_string, None) on any failure.
 
 def command_gate(command: str) -> tuple[str | None, str | None]:
-    """Vet a command string for a background session. Claude-only build:
-    pre-filter (quoting, no command substitution, script-run shape), server
-    source protection, and the destructive wall. Compound commands are fine —
-    the session runs the string through a shell.
+    """Vet a command string for a background session: pre-filter (quoting, no
+    command substitution, script-run shape; strict mode adds the allowlist
+    stack), server source protection, strict-mode SSH / exfil gates, and the
+    destructive wall. The session runs the vetted string through a shell.
+
+    In claude mode compound commands are fine. In strict mode a session is one
+    atomic command — no && / || / ; — and the string executed is the
+    shlex-rendered vetted block, so nothing the vetting did not see runs.
 
     Returns (None, command) on pass, (error_message, None) on any failure.
     """
@@ -84,8 +91,21 @@ def command_gate(command: str) -> tuple[str | None, str | None]:
     if pf.failed:
         return f"Pre-filter rejected: {pf.reason}", None
 
+    if strict_mode() and len(pf.raw_blocks) != 1:
+        return (
+            "start_process only accepts a single command in strict mode. "
+            "Compound commands (&&, ||, ;) are not allowed in process sessions. "
+            "Use lc_exec_command for compound one-shot commands instead.",
+            None,
+        )
+
     if command_targets_server_source(command):
         return "Blocked: commands targeting the server source directory are not permitted", None
+
+    if strict_mode() and command_requires_ssh_gate(command):
+        return "Blocked: SSH/SCP/SFTP/rsync are not permitted (strict mode network gate)", None
+    if strict_mode() and command_has_network_exfil(command):
+        return "Blocked: nc/curl/wget/socat are not permitted (strict mode network exfil gate)", None
 
     # Destructive hard wall — same rule as execute_command. A gate that one
     # tool enforces and another ignores is not a gate.
@@ -105,6 +125,8 @@ def command_gate(command: str) -> tuple[str | None, str | None]:
                 None,
             )
 
+    if strict_mode():
+        return None, pf.raw_blocks[0]
     return None, os.path.expanduser(command)
 
 

@@ -38,6 +38,45 @@ from typing import Optional
 SCRATCHPAD_DIR = pathlib.Path.home() / ".commander_workspace" / "scratchpad"
 OFFLOAD_CHARS = 8_000   # outputs larger than this go to disk instead of LLM context
 
+# ---------------------------------------------------------------------------
+# Mode switch — LAMSYSTEMS_COMMANDER_MODE
+# ---------------------------------------------------------------------------
+# "claude" (default): two gates only — the destructive wall and sudo. Any
+#     installed binary runs; pipes, redirects, globs, inline python/node all
+#     work. Built for driving the server from Claude.
+# "strict": the full pre-filter stack on top of those two gates — binary
+#     allowlist (WHITELIST), DANGEROUS_FLAGS, injection-char and path-traversal
+#     checks, redirect ban, interpreter script-path gate, SSH gate and network
+#     exfil gate. Built for leaving the server alone with a local model you do
+#     not fully trust.
+# Both modes keep: destructive wall + confirm dialog, sudo gate, server-source
+# protection, system-path write guard (files.py), script-run approval, and the
+# ban on $(...) / backticks.
+# The env var must be set in the MCP client's config block — MCP servers are
+# launched with a clean environment, so exporting it in a shell does nothing.
+
+_VALID_MODES = ("claude", "strict")
+
+
+def _resolve_mode() -> str:
+    raw = os.environ.get("LAMSYSTEMS_COMMANDER_MODE", "claude").strip().lower()
+    if raw == "":
+        return "claude"
+    if raw not in _VALID_MODES:
+        raise RuntimeError(
+            f"LAMSYSTEMS_COMMANDER_MODE={raw!r} is not valid; "
+            f"expected one of {', '.join(_VALID_MODES)}"
+        )
+    return raw
+
+
+COMMANDER_MODE: str = _resolve_mode()
+
+
+def strict_mode() -> bool:
+    """True when the full pre-filter stack is enforced."""
+    return COMMANDER_MODE == "strict"
+
 
 def _save_to_scratchpad(command: str, content: str) -> pathlib.Path:
     """Write command output to a timestamped scratchpad file. Returns the path."""
@@ -602,7 +641,24 @@ _SEQUENCE_OPERATORS = frozenset({"&&", "||", ";"})
 # Operators that end a command segment for the script-runner shape check.
 _SEGMENT_BREAKERS = _SHELL_OPERATORS | {">", ">>", "<", "2>", "&>"}
 
-# Retained for the local-model fork; not consulted on this build.
+# ---------------------------------------------------------------------------
+# STRICT-MODE pre-filter pieces (LAMSYSTEMS_COMMANDER_MODE=strict only)
+# ---------------------------------------------------------------------------
+# Structural operators that hard-fail the whole command if present anywhere.
+# Redirects only: they write files / read block devices, and there is no
+# per-segment vetting that makes them safe. The PIPE is NOT here — a pipeline
+# is a chain of vetted stages (see _vet_atomic).
+_HARD_BAN_TOKENS = frozenset({">", ">>", "<"})
+
+# Pipe operator. Kept inside an atomic block so the pipeline runs in ONE shell
+# invocation, but each stage is vetted separately.
+_PIPE = "|"
+
+# Characters that must not appear inside any argument after shlex tokenisation.
+_INJECTION_CHARS = frozenset(";&|$()`")
+
+# Interpreter script-path gate: blocks execution of scripts dropped into
+# user-writable / temp directories (closes lc_write_file -> python3 /tmp/x.py).
 _SCRIPT_INTERPRETERS: frozenset[str] = frozenset({"python", "python3", "node"})
 _RESTRICTED_SCRIPT_DIRS: tuple[pathlib.Path, ...] = (
     pathlib.Path("/tmp"),
@@ -610,16 +666,60 @@ _RESTRICTED_SCRIPT_DIRS: tuple[pathlib.Path, ...] = (
     pathlib.Path("/dev/shm"),
     pathlib.Path.home() / ".commander_workspace",
 )
+_SCRIPT_EXTENSIONS: frozenset[str] = frozenset({".py", ".js", ".mjs", ".cjs"})
+
+
+def _in_restricted_script_dir(arg: str) -> Optional[pathlib.Path]:
+    """The restricted directory `arg` resolves into, or None."""
+    try:
+        resolved = pathlib.Path(arg).resolve()
+    except Exception:
+        return None
+    for restricted in _RESTRICTED_SCRIPT_DIRS:
+        try:
+            resolved.relative_to(restricted.resolve())
+            return restricted
+        except ValueError:
+            pass
+    return None
+
+
+def _script_path_blocked(tokens: list[str]) -> str | None:
+    """Return an error string if tokens represent an interpreter running a
+    script from a user-writable or temp directory. Returns None on pass."""
+    if not tokens:
+        return None
+    binary = tokens[0].split("/")[-1]
+    if binary not in _SCRIPT_INTERPRETERS:
+        return None
+    for arg in tokens[1:]:
+        if arg.startswith("-"):
+            continue
+        is_path_like = "/" in arg or any(arg.endswith(ext) for ext in _SCRIPT_EXTENSIONS)
+        if not is_path_like:
+            continue
+        try:
+            pathlib.Path(arg).resolve()
+        except Exception:
+            return f"Script path could not be resolved: {arg!r}"
+        restricted = _in_restricted_script_dir(arg)
+        if restricted is not None:
+            return (
+                f"BLOCKED: executing a script from '{restricted}' is not permitted. "
+                f"Models may not run scripts they have dropped into writable or "
+                f"temporary directories. Move the script to a project directory "
+                f"or use an absolute path outside restricted locations."
+            )
+    return None
 
 # ---------------------------------------------------------------------------
-# CLAUDE-ONLY BUILD: WHITELIST, DISK_TOOLS and DANGEROUS_FLAGS below are
-# RETAINED BUT NOT ENFORCED. They stay importable so the local-model fork
-# (Lmstudio-commander) can keep pulling fixes, and so the history of what was
-# gated is readable. On this build the only runtime gates are the destructive
+# WHITELIST, DISK_TOOLS and DANGEROUS_FLAGS are ENFORCED ONLY IN STRICT MODE
+# (LAMSYSTEMS_COMMANDER_MODE=strict). In the default claude mode they are
+# importable but not consulted; the only runtime gates are the destructive
 # wall (lc_confirm_destructive) and sudo.
 # ---------------------------------------------------------------------------
-# Strict allowlist. (Historical: anything not listed was rejected at the
-# pre-filter.) Curated for an AI-orchestration / model-tuning workflow.
+# Strict allowlist. Anything not listed is rejected at the pre-filter.
+# Curated for an AI-orchestration / model-tuning workflow.
 #
 # Deliberate exclusions (do not add without thinking hard about why):
 #   ssh / scp / sftp / rsync          — also blocked by command_requires_ssh_gate
@@ -905,8 +1005,132 @@ def _vet_block(block: str) -> str | None:
     return None
 
 
+def _real_binary_index(tokens: list[str], unwrap_uv: bool = True) -> int:
+    """Index of the first token that is a real binary, skipping wrappers
+    (sudo, env, nice, timeout, ...) and their own flags / KEY=value / numeric
+    arguments. Matching is on the exact token, never the basename —
+    `/tmp/evil/ls` must not be admitted because it ends in a whitelisted name.
+    Returns -1 if the block is nothing but wrappers. Strict mode only."""
+    i = 0
+    while i < len(tokens):
+        if tokens[i] in _COMMAND_WRAPPERS:
+            i += 1
+            while i < len(tokens) and (
+                tokens[i].startswith("-") or "=" in tokens[i] or tokens[i].isdigit()
+            ):
+                i += 1
+            continue
+        if unwrap_uv and tokens[i] == "uv":
+            j, _err = _unwrap_uv_run(tokens, i)
+            if j > i and tokens[j] != "-m":
+                i = j
+                continue
+        return i
+    return -1
+
+
+def _vet_atomic(tokens: list[str]) -> str | None:
+    """Strict mode: vet one atomic block, which may be a pipeline. Every stage
+    is vetted as its own command. Returns an error string or None."""
+    if _PIPE not in tokens:
+        return _vet_command(tokens)
+    stage: list[str] = []
+    for tok in tokens:
+        if tok == _PIPE:
+            err = _vet_command(stage)
+            if err:
+                return err
+            stage = []
+        else:
+            stage.append(tok)
+    return _vet_command(stage)
+
+
+def _vet_command(tokens: list[str]) -> str | None:
+    """Strict mode: allowlist + injection + traversal + per-binary flag checks
+    + interpreter script-path gate on a single command (one pipeline stage)."""
+    if not tokens:
+        return "Empty atomic block"
+
+    # `uv run` flags are checked on the ORIGINAL tokens: once unwrapped, the
+    # binary under vetting is the target command and DANGEROUS_FLAGS["uv"]
+    # would never see them.
+    k = _real_binary_index(tokens, unwrap_uv=False)
+    if k >= 0 and tokens[k] == "uv":
+        j, err = _unwrap_uv_run(tokens, k)
+        if err:
+            return err
+        if j > k and tokens[j] == "-m":
+            return _vet_command(["python3", *tokens[j:]])
+
+    idx = _real_binary_index(tokens)
+    if idx < 0:
+        return f"No binary found after command wrapper(s): {' '.join(tokens)!r}"
+    binary, *args = tokens[idx:]
+
+    if binary not in WHITELIST:
+        return (
+            f"Binary not on whitelist: {binary} "
+            f"(strict mode is enabled — add to WHITELIST in shell.py to permit)"
+        )
+
+    for arg in args:
+        if any(c in _INJECTION_CHARS for c in arg):
+            return (
+                f"Injection character in argument: {arg!r} "
+                f"(shell metacharacters not permitted inside arguments)"
+            )
+
+    for arg in args:
+        if ".." in arg.split("/"):
+            return f"Path traversal detected in argument: {arg}"
+
+    banned = DANGEROUS_FLAGS.get(binary)
+    if banned:
+        for arg in args:
+            if arg in banned or arg.split("=", 1)[0] in banned:
+                return f"Dangerous flag for {binary}: {arg}"
+
+    if binary in SCRIPT_RUNNERS:
+        runner_err = _script_run_blocked(args)
+        if runner_err:
+            return runner_err
+        # Strict mode: shell scripts obey the same temp-dir rule as python/node.
+        if _in_restricted_script_dir(args[0]) is not None:
+            return (
+                f"BLOCKED: executing a shell script from a temporary or writable "
+                f"directory is not permitted in strict mode: {args[0]}"
+            )
+        return None
+
+    return _script_path_blocked(tokens[idx:])
+
+
+def _block_to_shell_str(block: list[str]) -> str:
+    """Strict mode: render a vetted atomic block for shell execution. Each
+    pipeline stage is shlex-quoted independently so no argument metachar can
+    escape; only the `|` between vetted stages is emitted bare."""
+    if _PIPE not in block:
+        return shlex.join(block)
+    parts: list[str] = []
+    stage: list[str] = []
+    for tok in block:
+        if tok == _PIPE:
+            parts.append(shlex.join(stage))
+            stage = []
+        else:
+            stage.append(tok)
+    parts.append(shlex.join(stage))
+    return " | ".join(parts)
+
+
 def pre_filter(raw_input: str) -> FilterResult:
-    """Vet a raw command string. Returns FilterResult (see class docstring)."""
+    """Vet a raw command string. Returns FilterResult (see class docstring).
+
+    Passes 0-4 run in both modes. Pass 5 (redirect ban, allowlist, injection /
+    traversal / dangerous-flag / script-path checks) runs only when
+    LAMSYSTEMS_COMMANDER_MODE=strict.
+    """
     # Pass 0: tilde expansion — keeps confirm tokens and executed strings equal.
     raw_input = os.path.expanduser(raw_input)
 
@@ -942,6 +1166,19 @@ def pre_filter(raw_input: str) -> FilterResult:
             atomic.append(shlex.split(block))
         except ValueError:
             atomic.append(block.split())
+
+    # Pass 5 (strict mode only): redirect ban + full per-block vetting.
+    if strict_mode():
+        for token in tokens:
+            if token in _HARD_BAN_TOKENS:
+                return _pf_fail(f"Forbidden structural operator: {token}")
+        for block_tokens in atomic:
+            err = _vet_atomic(block_tokens)
+            if err:
+                return _pf_fail(err)
+        # Strict mode executes the shlex-rendered tokens, not the raw string,
+        # so nothing the vetting did not see can reach the shell.
+        blocks = [_block_to_shell_str(b) for b in atomic]
 
     return FilterResult(passed=True, raw_blocks=blocks, operators=ops,
                         atomic_commands=atomic)
@@ -1038,11 +1275,14 @@ async def execute_command(
 ) -> dict:
     """Execute a shell command via the pre-filter pipeline.
 
-    Order of checks (each stage may reject) — Claude-only build:
-        1. Pre-filter            — quoting, no $(...)/backticks, script-run shape
+    Order of checks (each stage may reject):
+        1. Pre-filter            — quoting, no $(...)/backticks, script-run shape;
+                                   strict mode adds redirect ban, allowlist,
+                                   injection / traversal / dangerous-flag checks
         2. File integrity        — server source directory references
-        3. Destructive wall      — lc_confirm_destructive token
-        4. Per-block sudo + execution (&& / || / ; semantics honoured)
+        3. SSH + exfil gates     — strict mode only
+        4. Destructive wall      — lc_confirm_destructive token
+        5. Per-block sudo + execution (&& / || / ; semantics honoured)
 
     Each atomic block of a compound command (split on &&, ||, ;) runs as its
     own subprocess. Sudo authenticates per block — design's "sudo fires once
@@ -1078,8 +1318,34 @@ async def execute_command(
             "sudo_method": "blocked_file_integrity",
         }
 
+    # ---- SSH / remote shell gate and network exfil gate (strict mode) ----
+    if strict_mode() and command_requires_ssh_gate(command):
+        return {
+            "exit_code": -1,
+            "stdout": "",
+            "stderr": (
+                "BLOCKED: SSH, SCP, SFTP and rsync are not permitted in strict mode.\n"
+                "Remote shell access and file transfer to external hosts are disabled."
+            ),
+            "timed_out": False,
+            "sudo_used": False,
+            "sudo_method": "blocked_ssh_gate",
+        }
+    if strict_mode() and command_has_network_exfil(command):
+        return {
+            "exit_code": -1,
+            "stdout": "",
+            "stderr": (
+                "BLOCKED: nc, netcat, socat, curl and wget are not permitted in strict mode.\n"
+                "Network data transfer tools are disabled to prevent exfiltration."
+            ),
+            "timed_out": False,
+            "sudo_used": False,
+            "sudo_method": "blocked_network_exfil",
+        }
+
     # ---- Destructive hard wall ----
-    # One of the two gates this build keeps. Unchanged.
+    # Enforced in both modes. Unchanged.
     is_destructive = command_is_destructive(command)
     if is_destructive:
         # Check for a confirmed token FIRST — a fresh confirmation after a

@@ -1,8 +1,9 @@
-"""Stateless verification of shell.py's pre_filter and the two kept gates.
+"""Stateless verification of shell.py's pre_filter in CLAUDE mode (the
+default, LAMSYSTEMS_COMMANDER_MODE unset or "claude"), then runs
+test_prefilter_strict.py for strict mode. Pass --claude-only to skip strict.
 
-CLAUDE-ONLY BUILD. The allowlist, dangerous-flag, injection, traversal,
-redirect, SSH and network-exfil gates are not enforced here. What this suite
-checks:
+In claude mode the allowlist, dangerous-flag, injection, traversal, redirect,
+SSH and network-exfil gates are not enforced. What this suite checks:
   "pass"           — pre-filter passes AND the destructive wall does not fire
   "fail_prefilter" — pre-filter fails (bad quoting, $(...)/backticks, or a
                      shell-script run in a non-approvable shape)
@@ -11,8 +12,11 @@ checks:
 Plus: block splitting semantics and the script approval-token behaviour.
 """
 
+import os
 import sys
 import pathlib
+
+os.environ.pop("LAMSYSTEMS_COMMANDER_MODE", None)   # force the default
 
 # Make shell.py importable by adding the repo-relative src/ to sys.path.
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "src"))
@@ -43,6 +47,7 @@ sys.modules["lamsystems_commander.prompt"] = fake_prompt
 
 from lamsystems_commander.shell import (
     pre_filter,
+    strict_mode,
     command_is_destructive,
     _split_raw_blocks,
     register_confirmed_command,
@@ -145,6 +150,8 @@ CASES = [
 
 
 def main() -> int:
+    assert not strict_mode(), "expected claude mode (LAMSYSTEMS_COMMANDER_MODE unset)"
+    print("mode: claude")
     print(f"WHITELIST size: {len(WHITELIST)} binaries")
     print(f"DANGEROUS_FLAGS entries: {len(DANGEROUS_FLAGS)} binaries")
     print()
@@ -243,4 +250,10 @@ def token_tests() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    rc = main()
+    if "--claude-only" not in sys.argv:
+        import subprocess
+        print("\n" + "=" * 80 + "\nstrict mode (test_prefilter_strict.py)\n" + "=" * 80)
+        strict = pathlib.Path(__file__).resolve().parent / "test_prefilter_strict.py"
+        rc = subprocess.call([sys.executable, str(strict)]) or rc
+    raise SystemExit(rc)

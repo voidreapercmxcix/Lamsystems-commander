@@ -90,7 +90,11 @@ class ExecCommandInput(BaseModel):
 
 
 def _exec_command_description() -> str:
-    """lc_exec_command tool description. Claude-only build: no allowlist."""
+    """lc_exec_command tool description. Depends on LAMSYSTEMS_COMMANDER_MODE:
+    strict mode generates the rules from the LIVE allowlist so the model is told
+    exactly what it may run instead of discovering the rules by trial-and-error."""
+    if shell.strict_mode():
+        return _exec_command_description_strict()
     return (
         "Run a shell command on the host. Any installed binary runs; pipes, "
         "redirects, globs, `&&` / `||` / `;` sequencing and `~` all work as in a "
@@ -109,6 +113,46 @@ def _exec_command_description() -> str:
         "`$(...)` command substitution and backticks are rejected because the "
         "destructive gate cannot inspect what runs inside them - run the inner "
         "command as its own step.\n"
+        "Commands referencing the commander's own source directory are refused.\n\n"
+        "Returns a block with exit code, stdout, and stderr."
+    )
+
+
+def _exec_command_description_strict() -> str:
+    allowed = ", ".join(sorted(shell.WHITELIST))
+    return (
+        "Run a shell command on the host, through a strict security allowlist "
+        "(LAMSYSTEMS_COMMANDER_MODE=strict). Read these rules first - a command "
+        "that breaks any of them is rejected before it runs (you get a "
+        "'BLOCKED: ...' error, not output).\n\n"
+        "ALLOWED BINARIES - only these run; anything else is rejected, even under "
+        f"sudo:\n{allowed}\n\n"
+        "RULES:\n"
+        "- No inline code and no sh/perl/ruby. To run a script use "
+        "`python3 FILE.py` or `node FILE.js` - a script FILE, never inline code "
+        "(`python3 -c ...` / `node -e ...` are blocked). Scripts in /tmp, "
+        "/var/tmp, /dev/shm or ~/.commander_workspace will not run.\n"
+        "- Shell scripts: ONLY `bash /absolute/path/script.sh [args]` (full path, "
+        "no `~`, no bash flags, never `bash -c`). EVERY run needs user approval: "
+        "call lc_confirm_destructive with the exact command first. If the script "
+        "file changes after approval, the approval is void.\n"
+        "- Pipes work: `a | b | c` (every stage must be an allowed binary). "
+        "Sequencing works: `a && b`, `a || b`, `a ; b`.\n"
+        "- Redirects `>`, `>>`, `<` are BANNED. To write a file, use `tee` or a "
+        "`python3` script.\n"
+        "- No shell metacharacters INSIDE an argument (semicolon, ampersand, pipe, "
+        "dollar, parentheses, backtick). e.g. `grep 'a|b'` is rejected - use "
+        "`grep -e a -e b`. `$(...)` command substitution and backticks are banned.\n"
+        "- No `..` path traversal in an argument.\n"
+        "- Package managers (dnf, rpm, pip, npm, yarn, pnpm, cargo) allow read-only "
+        "subcommands only; install/remove/update/upgrade are blocked.\n"
+        "- ssh/scp/sftp/rsync and nc/curl/wget/socat are blocked outright.\n"
+        "- DESTRUCTIVE operations need user approval: every `rm`, `dd`, `mkfs*`, "
+        "`shred`, `wipefs`, partition editors in write mode. Call "
+        "lc_confirm_destructive with the exact command string first.\n"
+        "- sudo: prefix an allowed binary with `sudo` (e.g. `sudo dmesg`); a "
+        "one-time password dialog appears for that command. sudo on a "
+        "non-allowed binary is still rejected.\n"
         "Commands referencing the commander's own source directory are refused.\n\n"
         "Returns a block with exit code, stdout, and stderr."
     )
