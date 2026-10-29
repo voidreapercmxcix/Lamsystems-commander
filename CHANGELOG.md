@@ -34,6 +34,16 @@ versions follow [SemVer](https://semver.org/).
   the destructive wall.
 
 ### Fixed
+- **Approval dialogs could show no command.** zenity parses its text as
+  Pango markup and kdialog as rich text, so any command containing `&`, `<`
+  or `>` (every `&&`, every `2>&1`) failed to render and the dialog read
+  "Are you sure you want to proceed?" with no command at all. zenity now runs
+  with `--no-markup`, kdialog text is escaped, dialog stderr is written to the
+  tool log instead of being swallowed, and both dialogs are 600px wide.
+- On KDE Plasma, kdialog is tried before zenity (one dialog with command and
+  password together; KWin rules can keep it on top). Detected via
+  `XDG_CURRENT_DESKTOP` with a `/proc` kwin probe fallback, since MCP clients
+  launch the server with a clean environment.
 - `lc_confirm_destructive` treated a zenity launch failure (no display, crash)
   as a user decline and locked the command out for the session. Dialogs now
   discover `DISPLAY`/`WAYLAND_DISPLAY` from the session sockets, capture
