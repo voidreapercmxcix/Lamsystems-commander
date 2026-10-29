@@ -1,7 +1,7 @@
 {
   "mcpServers": {
     "lamsystems-commander": {
-      "command": "/home/lam/Documents/Lamsystems-commander/.venv/bin/lamsystems-commander",
+      "command": "/path/to/Lamsystems-commander/.venv/bin/lamsystems-commander",
       "args": [],
       "env": {}
     }

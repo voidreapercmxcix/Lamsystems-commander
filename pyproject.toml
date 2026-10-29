@@ -10,6 +10,20 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "James (LamSystems)" }]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Security",
+    "Topic :: System :: Shells",
+]
 keywords = ["mcp", "claude", "terminal", "shell", "sudo", "allowlist", "desktop-commander"]
 
 dependencies = [
@@ -17,6 +31,12 @@ dependencies = [
     "pydantic>=2.5",
     "rank-bm25>=0.2.2",
 ]
+
+[project.urls]
+Homepage = "https://github.com/voidreapercmxcix/Lamsystems-commander"
+Repository = "https://github.com/voidreapercmxcix/Lamsystems-commander"
+Issues = "https://github.com/voidreapercmxcix/Lamsystems-commander/issues"
+Changelog = "https://github.com/voidreapercmxcix/Lamsystems-commander/blob/main/CHANGELOG.md"
 
 [project.scripts]
 lamsystems-commander = "lamsystems_commander.__main__:main"
